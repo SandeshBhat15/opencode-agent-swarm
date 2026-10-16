@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: the suite only needs to read the repo and write a temp dir.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # The repo is Windows-first (OpenCode Desktop, PowerShell), but the kit is
+    # stdlib-only Python and should behave identically on POSIX.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.14 is the version the suite was actually executed against.
+          python-version: "3.14"
+
+      # No install step: swarmkit is stdlib-only by design, so adding a
+      # dependency here would be a regression against that rule, not a
+      # prerequisite for running the tests.
+      - name: Contract lint (agent pages)
+        run: python -m swarmkit lint --root .
+
+      - name: Self-test
+        run: python -m swarmkit selftest
+
+      - name: Unit + integration suite
+        run: python -m unittest discover -s tests -t . -v
+
+      # The worktree integration tests shell out to git; confirm git is present
+      # and behaving, so a green suite is not masking an absent tool.
+      - name: Git available
+        run: git --version
+
+  probe-old-python:
+    # Compatibility probe, NOT a gate.
+    # The code uses no syntax or stdlib API newer than 3.11 (checked by hand: no
+    # PEP 695 type-parameter syntax, no Path.walk, no itertools.batched, no
+    # tomllib), but 3.12 was never executed locally. It is allowed to fail until
+    # someone actually runs the suite on it. Flip continue-on-error to false
+    # once it has genuinely gone green.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Contract lint
+        run: python -m swarmkit lint --root .
+      - name: Suite
+        run: python -m unittest discover -s tests -t .

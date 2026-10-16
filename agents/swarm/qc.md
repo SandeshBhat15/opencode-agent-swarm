@@ -5,19 +5,19 @@ permissions:
   - action: edit
     resource: "*"
     effect: deny
-  - action: bash
+  - action: shell
     resource: "*"
     effect: allow
-  - action: bash
+  - action: shell
     resource: "git push*"
     effect: deny
-  - action: bash
+  - action: shell
     resource: "git reset*"
     effect: deny
-  - action: bash
+  - action: shell
     resource: "rm -rf*"
     effect: deny
-  - action: bash
+  - action: shell
     resource: "Remove-Item* -Recurse*"
     effect: deny
 ---
