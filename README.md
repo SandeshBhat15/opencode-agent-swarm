@@ -16,7 +16,7 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
 | **2 commands** | `/swarm <task>` and `/swarm-status` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 160 tests, no network, no API spend |
+| **`tests/`** | 163 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -246,7 +246,7 @@ rather than becoming an archive.
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 160 tests
+python -m unittest discover -s tests -t .     # 163 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
 python -m swarmkit selftest                   # quick end-to-end gate check
 ```
