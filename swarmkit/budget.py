@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .errors import BudgetExceeded, ConfigError
+from .errors import BudgetExceeded, ConfigError, SwarmError
 from .store import atomic_write_json, read_json, utcnow
 
 
@@ -84,6 +84,22 @@ class Limits:
             "max_wall_clock_seconds": self.max_wall_clock_seconds,
             "max_tokens": self.max_tokens,
         }
+
+
+def _corrupt_budget(run_dir: Path, detail: str) -> SwarmError:
+    """A malformed budget.json is a SwarmError, not a traceback.
+
+    Counters in this file are the only thing that makes caps hold across CLI
+    invocations. Silently resetting them would let a run bypass its spawn and
+    retry limits, so an unreadable file is refused loudly instead.
+    """
+    return SwarmError(
+        f"budget.json in {run_dir} is unreadable ({detail}). Refusing to guess: "
+        "these counters are what enforce max_spawns_total and "
+        "max_retries_per_worker. Move it aside to reset the budget, or restore "
+        "the file if the run must continue.",
+        code="CORRUPT_BUDGET",
+    )
 
 
 @dataclass
@@ -227,12 +243,21 @@ class Budget:
         it is gone, and keeping it would deadlock the resumed run.
         """
         raw = read_json(Path(run_dir) / "budget.json", default={}) or {}
+        if not isinstance(raw, dict):
+            raise _corrupt_budget(run_dir, f"expected a JSON object, got {type(raw).__name__}")
         budget = cls(limits=limits or Limits.from_dict(raw.get("limits")))
-        budget.spawns = int(raw.get("spawns", 0) or 0)
-        budget.tokens_in = int(raw.get("tokens_in", 0) or 0)
-        budget.tokens_out = int(raw.get("tokens_out", 0) or 0)
-        retries = raw.get("retries")
-        budget.retries = {str(k): int(v) for k, v in retries.items()} if isinstance(retries, dict) else {}
+        try:
+            budget.spawns = int(raw.get("spawns", 0) or 0)
+            budget.tokens_in = int(raw.get("tokens_in", 0) or 0)
+            budget.tokens_out = int(raw.get("tokens_out", 0) or 0)
+            retries = raw.get("retries")
+            budget.retries = (
+                {str(k): int(v) for k, v in retries.items()}
+                if isinstance(retries, dict)
+                else {}
+            )
+        except (TypeError, ValueError) as exc:
+            raise _corrupt_budget(run_dir, f"{exc}") from exc
         try:
             budget.started_at = float(raw.get("started_at") or 0) or time.time()
         except (TypeError, ValueError):

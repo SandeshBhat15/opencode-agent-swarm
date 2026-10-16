@@ -116,8 +116,20 @@ class TestClock(unittest.TestCase):
     def test_fresh_clock_passes(self) -> None:
         Budget(limits=Limits(max_wall_clock_seconds=3600)).check_clock()
 
-    def test_elapsed_is_measurable(self) -> None:
-        self.assertGreaterEqual(Budget().elapsed(), 0.0)
+    def test_elapsed_tracks_wall_clock(self) -> None:
+        """elapsed() must actually read the clock, not return a constant."""
+        b = Budget()
+        first = b.elapsed()
+        time.sleep(0.05)
+        second = b.elapsed()
+        self.assertGreaterEqual(first, 0.0)
+        self.assertGreater(second, first, "elapsed() did not advance over 50ms")
+
+    def test_elapsed_reflects_an_explicit_start(self) -> None:
+        """A budget restored from disk measures from its recorded start."""
+        b = Budget()
+        b.started_at = time.time() - 120.0
+        self.assertGreaterEqual(b.elapsed(), 119.0)
 
 
 class TestCost(unittest.TestCase):

@@ -108,7 +108,7 @@ Then make both machine-checkable, because prose boundaries are a suggestion and 
 
 ```
 python -m swarmkit criterion add --id <ws>-builds --text "npm run build exits 0"
-python -m swarmkit scope plan --ws build=src/**,vite.config.ts --ws ui=src/ui/** --strict
+python -m swarmkit scope plan --ws build=src/build/**,vite.config.ts --ws ui=src/ui/** --strict
 ```
 
 `scope plan` fails closed. It rejects unbounded globs (`*`, `**`), `..` escapes, protected trees

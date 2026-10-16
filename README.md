@@ -16,7 +16,7 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
 | **2 commands** | `/swarm <task>` and `/swarm-status` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 163 tests, no network, no API spend |
+| **`tests/`** | 191 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -246,7 +246,7 @@ rather than becoming an archive.
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 163 tests
+python -m unittest discover -s tests -t .     # 191 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
 python -m swarmkit selftest                   # quick end-to-end gate check
 ```
@@ -276,8 +276,13 @@ non-blocking job probes Python 3.12.
 | `BudgetExceeded` on spawn | Concurrency cap, spawn cap, or the wall clock. `budget show` says which |
 | `SCOPE_CONFLICT` | Two workstreams can write the same path. Re-cut the scopes |
 | `SwarmError: RUN_EXISTS` | That slug already exists. Pick another slug, or resume the existing run |
-| `SCOPE_CONFLICT_POSSIBLE` | Overlap that could not be proven disjoint. Fails closed on purpose — split the scope |
-| Worker appears hung | Leases self-heal after 15 min. Check `budget show` and the worker's own log |
+| `SCOPE_CONFLICT_POSSIBLE` | Overlap that could not be proven disjoint. Fails closed on purpose - split the scope |
+| `CORRUPT_STATE` | `state.json` is unreadable or missing `slug`/`phase`. Move it aside and `run recover`, or delete the run - `run init` regenerates it |
+| `CORRUPT_BUDGET` | `budget.json` is unreadable. Refused rather than reset, because these counters are what enforce the spawn/retry caps across CLI calls |
+| `AMBIGUOUS_RUN` | A bare slug matched more than one run. Pass the full directory name, e.g. the `<date>-<slug>` form |
+| `NO_SUCH_WORKTREE` | `iso --ws` name is unknown. The message lists the workstreams the manifest actually holds |
+| `BAD_USAGE` on `run phase` | Neither a positional phase nor `--to` was given, or the two disagreed |
+| Worker appears hung | **There is no liveness detection** - swarmkit cannot tell you a worker died. A lease frees itself after 15 min, but nothing reports it as stale. Check the worker's own output |
 
 ### Recovering an interrupted run
 
@@ -323,6 +328,20 @@ Honest list, not marketing:
   They are marked `UNVERIFIED (not promoted)`.
 - **No end-to-end run against a live model has been performed.** Everything verified here is the
   mechanism layer, the CLI, and the agent-page contracts. The orchestration itself is unexercised.
+- **There is no worker-liveness detection.** `swarmkit` has no heartbeat, no poll, and no watchdog.
+  A worker that dies silently is indistinguishable from one that finished until you notice the
+  missing output yourself. A lease older than 15 minutes is dropped so the slot frees up, but
+  `budget show` reports **no stale/dead/reclaimed field**, so that reclamation is invisible. Treat
+  every spawn as needing a manual health check. Detecting and retrying dead workers is on the
+  roadmap, not implemented.
+- **Retry caps only hold if you call `budget retry`.** `max_retries_per_worker` is enforced when
+  `record_retry` runs, which only the explicit `budget retry` command triggers. An orchestrator that
+  forgets to record a retry is never stopped by swarmkit. The fix-cycle cap is different - that one is
+  enforced by `run phase` itself and cannot be bypassed from the CLI.
+- **`lint` checks frontmatter only.** It validates agent pages' YAML (V2 permission actions, model
+  pins, deny-before-allow ordering, command bindings). It never parses a page body, so it cannot
+  verify that a documented CLI invocation actually works - `tests/test_cli.py` does that instead by
+  executing the documented strings verbatim.
 - **Worktree isolation requires git and a git repo.** Without one, only scope validation applies.
 - **`--json` is a global flag** and must precede the subcommand: `swarm --json run list`.
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,6 +20,29 @@ from .budget import Budget, Limits
 from .errors import SwarmError
 
 DEFAULT_LESSONS = Path.home() / ".config" / "opencode" / "swarm-lessons.md"
+
+# ABORTED is a legal target but is not part of phases.PHASES (that tuple is the
+# linear pipeline). Every phase-taking parser must offer it.
+_PHASE_CHOICES = list(phases.PHASES) + [phases.ABORTED]
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def dated_slug(slug: str) -> str:
+    """Prefix a bare slug with today's date.
+
+    ``agents/swarm.md`` documents the run dir as
+    ``.opencode/swarm/<YYYY-MM-DD>-<short-slug>/``, which groups runs by day.
+    ``store.init_run`` deliberately does not invent a date (a library caller
+    controls its own naming), so the convention is applied here at the CLI
+    boundary. A slug that already starts with a date is left alone.
+    """
+    if not slug:
+        return slug
+    head = slug[:10]
+    if _ISO_DATE.match(head):
+        return slug
+    return f"{store.utcnow()[:10]}-{slug}"
 
 
 def _emit(payload: dict[str, Any], as_json: bool, human: str = "") -> int:
@@ -62,7 +86,9 @@ def _budget(args: argparse.Namespace, run_dir: Path) -> Budget:
 
 def cmd_run_init(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
-    slug = store.slugify(args.slug or args.title or "")
+    # `--goal` is the form agents/swarm.md documents; `--title` is kept as an alias.
+    slug = store.slugify(args.slug or args.goal or args.title or "")
+    slug = dated_slug(slug)
     run_dir = store.init_run(workspace, slug)
     return _emit(
         {"slug": slug, "run_dir": str(run_dir)},
@@ -98,6 +124,15 @@ def cmd_run_show(args: argparse.Namespace) -> int:
     run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
     state = store.RunState.load(run_dir)
     journal = store.pending_journal(run_dir)
+    # agents/swarm.md promises run show prints the phase, the next action, the open
+    # criteria, and which still lack evidence. That is the documented resume path,
+    # so it has to actually carry them.
+    try:
+        result = gate.evaluate(run_dir)
+    except SwarmError:
+        result = gate.GateResult(results=[])
+    open_ids = [r.criterion.id for r in result.results]
+    unproven = [r.criterion.id for r in result.results if not r.passed]
     payload = {
         "slug": state.slug,
         "phase": state.phase,
@@ -106,23 +141,48 @@ def cmd_run_show(args: argparse.Namespace) -> int:
         "run_dir": str(run_dir),
         "interrupted": journal,
         "workstreams": state.workstreams,
+        "next_action": spec_for(state.phase),
+        "criteria": open_ids,
+        "criteria_needing_evidence": unproven,
+        "gate_open": result.open,
     }
     lines = [
         f"run     {state.slug}",
         f"phase   {state.phase}",
         f"cycles  {state.fix_cycles}",
         f"dir     {run_dir}",
+        f"next    {payload['next_action']}",
+        f"gate    {'OPEN' if result.open else 'CLOSED'}",
+        f"criteria{'' if not open_ids else ' ' + ', '.join(open_ids)}",
     ]
+    if unproven:
+        lines.append(f"unproven {', '.join(unproven)}")
+    if not open_ids:
+        lines.append("unproven (no criteria declared yet - add them in PLAN)")
     if journal:
         lines.append(f"!! INTERRUPTED mid-{journal.get('op')} on {journal.get('target')}")
-        lines.append(f"   run: swarm run recover --slug {state.slug} --note \"...\"")
+        lines.append(f"   run: swarm run recover --slug {state.slug}")
     return _emit(payload, args.json, "\n".join(lines))
 
 
 def cmd_run_phase(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     run_dir = _run_dir(workspace, args.slug)
-    target = args.to.upper()
+    # agents/swarm.md documents `run phase <PHASE>`; `--to` remains supported.
+    positional = getattr(args, "target", None)
+    flag = getattr(args, "to", None)
+    if positional and flag and positional.upper() != flag.upper():
+        raise SwarmError(
+            f"positional {positional} and --to {flag} disagree; pass exactly one",
+            code="BAD_USAGE",
+        )
+    raw = positional or flag
+    if not raw:
+        raise SwarmError(
+            "a target phase is required: `run phase <PHASE>` or `run phase --to <PHASE>`",
+            code="BAD_USAGE",
+        )
+    target = raw.upper()
     store.require_clean(run_dir)
     state = store.RunState.load(run_dir)
     current = state.phase
@@ -187,7 +247,16 @@ def spec_for(phase: str) -> str:
 def cmd_run_recover(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     run_dir = _run_dir(workspace, args.slug)
-    result = store.recover(run_dir, args.note)
+    # `--note` is optional: agents/swarm.md documents a bare `run recover`.
+    # Without one, derive a note from the journal so history.md stays truthful.
+    note = args.note
+    if not note:
+        entry = store.pending_journal(run_dir) or {}
+        note = (
+            f"manual recovery: cleared stalled {entry.get('op', 'mutation')} "
+            f"on {entry.get('target', 'unknown target')}"
+        )
+    result = store.recover(run_dir, note)
     return _emit(result, args.json, f"recovered {run_dir.name}: cleared {result['cleared'] or 'nothing'}")
 
 
@@ -315,33 +384,100 @@ def cmd_scope_plan(args: argparse.Namespace) -> int:
     return _emit(result, args.json, human)
 
 
+ISO_MANIFEST = "swarm-worktrees.json"
+ISO_TREES_DEFAULT = ".swarm-trees"
+
+
+def _iso_manifest(tree_root: Path) -> dict[str, dict[str, str]]:
+    try:
+        raw = json.loads(Path(tree_root).joinpath(ISO_MANIFEST).read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _iso_write_manifest(tree_root: Path, mapping: dict[str, dict[str, str]]) -> None:
+    store.atomic_write_json(Path(tree_root) / ISO_MANIFEST, mapping)
+
+
+def _iso_trees(args: argparse.Namespace) -> Path:
+    """Resolve the worktree root against the repo, not the process CWD.
+
+    The documented default is a relative `.swarm-trees`. Resolving it against the
+    CWD scatters worktrees into whichever directory swarmkit happened to be invoked
+    from, so `iso create` wrote a manifest somewhere `iso patch` could not find it.
+    """
+    raw = Path(args.trees)
+    if raw.is_absolute():
+        return raw
+    return Path(args.repo).resolve() / raw
+
+
+def _iso_resolve(trees: Path, name: str | None) -> Path:
+    """Map a workstream name to its worktree path.
+
+    agents/swarm.md tells the orchestrator to think in workstreams (`iso patch
+    --ws build`), not in paths. Without this, every documented iso command after
+    `create` would be unusable and the orchestrator would fall back to hand-running
+    git against paths it invented.
+    """
+    if not name:
+        raise SwarmError(
+            "a workstream name is required: `iso ... --ws <name>` (or pass --wt/--patch directly)",
+            code="BAD_USAGE",
+        )
+    mapping = _iso_manifest(trees)
+    entry = mapping.get(name)
+    if not entry or not entry.get("path"):
+        known = ", ".join(sorted(mapping)) or "(none)"
+        raise SwarmError(
+            f"no worktree recorded for workstream {name!r}; known: {known}. "
+            f"Run `iso create --ws {name} --trees {trees}` first.",
+            code="NO_SUCH_WORKTREE",
+        )
+    return Path(entry["path"])
+
+
 def cmd_iso_create(args: argparse.Namespace) -> int:
     repo = isolator.repo_root(Path(args.repo))
-    trees = isolator.create_worktrees(repo, Path(args.trees), isolator.split_scope(args.ws))
+    # --ws MUST append. Without it argparse keeps the last occurrence and silently
+    # drops every workstream but one, with exit 0 and no warning.
+    names = [n.strip() for n in (args.ws if isinstance(args.ws, list) else [args.ws]) if n.strip()]
+    if not names:
+        raise SwarmError("iso create needs at least one --ws", code="BAD_USAGE")
+    tree_root = _iso_trees(args)
+    trees = isolator.create_worktrees(repo, tree_root, names)
+    mapping = _iso_manifest(tree_root)
+    for w in trees:
+        mapping[w.name] = {"path": str(w.path), "branch": w.branch}
+    _iso_write_manifest(tree_root, mapping)
     rows = [w.to_dict() for w in trees]
     human = "\n".join(f"{w.name:<16} {w.branch:<28} {w.path}" for w in trees)
-    return _emit({"worktrees": rows}, args.json, human)
+    return _emit({"worktrees": rows, "trees": str(tree_root), "manifest": mapping}, args.json, human)
 
 
 def cmd_iso_patch(args: argparse.Namespace) -> int:
     repo = isolator.repo_root(Path(args.repo))
-    patch = isolator.worktree_patch(repo, Path(args.wt), base=args.base)
-    out = Path(args.out)
+    wt_path = Path(args.wt) if args.wt else _iso_resolve(_iso_trees(args), args.ws)
+    patch = isolator.worktree_patch(repo, wt_path, base=args.base)
+    out = Path(args.out) if args.out else _iso_trees(args) / f"{wt_path.name}.patch"
     store.atomic_write_text(out, patch)
-    return _emit({"patch": str(out), "bytes": len(patch)}, args.json,
+    return _emit({"patch": str(out), "bytes": len(patch), "worktree": str(wt_path)}, args.json,
                  f"wrote {out} ({len(patch)} bytes)")
 
 
 def cmd_iso_integrate(args: argparse.Namespace) -> int:
     repo = isolator.repo_root(Path(args.repo))
-    result = isolator.integrate_patch(repo, Path(args.patch), three_way=not args.no_three_way)
+    patch = Path(args.patch) if args.patch else _iso_trees(args) / f"{args.ws}.patch"
+    result = isolator.integrate_patch(repo, patch, three_way=not args.no_three_way)
     human = "applied" if result["applied"] else f"NOT applied: {result['reason']}\n{result['detail']}"
     return _emit(result, args.json, human)
 
 
 def cmd_iso_remove(args: argparse.Namespace) -> int:
     repo = isolator.repo_root(Path(args.repo))
-    result = isolator.remove_worktree(repo, Path(args.wt))
+    wt_path = Path(args.wt) if args.wt else _iso_resolve(_iso_trees(args), args.ws)
+    result = isolator.remove_worktree(repo, wt_path)
     return _emit(result, args.json, "removed" if result["removed"] else result["detail"])
 
 
@@ -419,14 +555,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run lifecycle").add_subparsers(dest="cmd", required=True)
     i = run.add_parser("init"); i.add_argument("--slug"); i.add_argument("--title")
+    i.add_argument("--goal", help="artifact-first goal sentence (the documented form)")
     i.set_defaults(func=cmd_run_init)
     l = run.add_parser("list"); l.set_defaults(func=cmd_run_list)
     s = run.add_parser("show"); s.add_argument("--slug"); s.set_defaults(func=cmd_run_show)
     ph = run.add_parser("phase")
-    ph.add_argument("--to", required=True, choices=[x for x in phases.PHASES] + ["ABORTED"])
+    ph.add_argument("target", nargs="?", choices=_PHASE_CHOICES,
+                    help="target phase, e.g. `run phase DELIVERED`")
+    ph.add_argument("--to", choices=_PHASE_CHOICES, help="alias for the positional form")
     ph.add_argument("--slug"); ph.add_argument("--reason")
     ph.set_defaults(func=cmd_run_phase)
-    rc = run.add_parser("recover"); rc.add_argument("--slug"); rc.add_argument("--note", required=True)
+    rc = run.add_parser("recover"); rc.add_argument("--slug"); rc.add_argument("--note")
     rc.set_defaults(func=cmd_run_recover)
     pt = run.add_parser("phases"); pt.set_defaults(func=cmd_run_phases)
 
@@ -447,12 +586,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser("budget").add_subparsers(dest="cmd", required=True)
     bs = b.add_parser("show"); bs.add_argument("--slug"); bs.set_defaults(func=cmd_budget_show)
-    bp = b.add_parser("spawn"); bp.add_argument("--name", required=True); bp.add_argument("--role")
-    bp.add_argument("--slug"); bp.set_defaults(func=cmd_budget_spawn)
-    br = b.add_parser("release"); br.add_argument("--name", required=True); br.add_argument("--slug")
-    br.set_defaults(func=cmd_budget_release)
-    by = b.add_parser("retry"); by.add_argument("--name", required=True); by.add_argument("--slug")
-    by.set_defaults(func=cmd_budget_retry)
+    # `--worker` is the documented spelling; `--name` stays as an alias.
+    bp = b.add_parser("spawn"); bp.add_argument("--name", "--worker", dest="name", required=True)
+    bp.add_argument("--role"); bp.add_argument("--slug"); bp.set_defaults(func=cmd_budget_spawn)
+    br = b.add_parser("release"); br.add_argument("--name", "--worker", dest="name", required=True)
+    br.add_argument("--slug"); br.set_defaults(func=cmd_budget_release)
+    by = b.add_parser("retry"); by.add_argument("--name", "--worker", dest="name", required=True)
+    by.add_argument("--slug"); by.set_defaults(func=cmd_budget_retry)
     bt = b.add_parser("tokens"); bt.add_argument("--in", dest="tokens_in", type=int, default=0)
     bt.add_argument("--out", dest="tokens_out", type=int, default=0)
     bt.add_argument("--slug"); bt.set_defaults(func=cmd_budget_tokens)
@@ -462,14 +602,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--strict", action="store_true"); sp.set_defaults(func=cmd_scope_plan)
 
     iso = sub.add_parser("iso").add_subparsers(dest="cmd", required=True)
-    ic = iso.add_parser("create"); ic.add_argument("--repo", default="."); ic.add_argument("--trees", required=True)
-    ic.add_argument("--ws", required=True); ic.set_defaults(func=cmd_iso_create)
-    ip = iso.add_parser("patch"); ip.add_argument("--repo", default="."); ip.add_argument("--wt", required=True)
-    ip.add_argument("--out", required=True); ip.add_argument("--base"); ip.set_defaults(func=cmd_iso_patch)
-    ii = iso.add_parser("integrate"); ii.add_argument("--repo", default="."); ii.add_argument("--patch", required=True)
-    ii.add_argument("--no-three-way", action="store_true"); ii.set_defaults(func=cmd_iso_integrate)
-    ir = iso.add_parser("remove"); ir.add_argument("--repo", default="."); ir.add_argument("--wt", required=True)
-    ir.set_defaults(func=cmd_iso_remove)
+    ic = iso.add_parser("create"); ic.add_argument("--repo", default=".")
+    ic.add_argument("--trees", default=ISO_TREES_DEFAULT)
+    ic.add_argument("--ws", action="append", required=True); ic.set_defaults(func=cmd_iso_create)
+    ip = iso.add_parser("patch"); ip.add_argument("--repo", default=".")
+    ip.add_argument("--wt"); ip.add_argument("--out"); ip.add_argument("--base")
+    ip.add_argument("--ws"); ip.add_argument("--trees", default=ISO_TREES_DEFAULT)
+    ip.set_defaults(func=cmd_iso_patch)
+    ii = iso.add_parser("integrate"); ii.add_argument("--repo", default=".")
+    ii.add_argument("--patch"); ii.add_argument("--no-three-way", action="store_true")
+    ii.add_argument("--ws"); ii.add_argument("--trees", default=ISO_TREES_DEFAULT)
+    ii.set_defaults(func=cmd_iso_integrate)
+    ir = iso.add_parser("remove"); ir.add_argument("--repo", default=".")
+    ir.add_argument("--wt"); ir.add_argument("--ws")
+    ir.add_argument("--trees", default=ISO_TREES_DEFAULT); ir.set_defaults(func=cmd_iso_remove)
 
     ls = sub.add_parser("lesson").add_subparsers(dest="cmd", required=True)
     la = ls.add_parser("add"); la.add_argument("--rule", required=True); la.add_argument("--failure", required=True)

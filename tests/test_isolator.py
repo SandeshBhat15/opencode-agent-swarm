@@ -75,13 +75,24 @@ class TestOverlap(unittest.TestCase):
         self.assertEqual(overlap_kind("src/ui", "src/ui/x.ts"), "definite")
 
     def test_glob_under_a_glob_never_reports_none(self) -> None:
-        # Either is defensible; 'none' would be the dangerous answer.
-        self.assertIn(
-            overlap_kind("src/**", "src/ui/x.ts"), {"definite", "possible"}
-        )
-        self.assertIn(
-            overlap_kind("src/**/*.ts", "src/ui/*.ts"), {"definite", "possible"}
-        )
+        # Fail-closed: a glob that could cover a concrete path must never be
+        # reported as disjoint. Assert the *property*, not one allowed value,
+        # so a regression that hard-codes 'definite' everywhere is also caught.
+        for a, b in [
+            ("src/**", "src/ui/x.ts"),
+            ("src/**/*.ts", "src/ui/*.ts"),
+            ("src/*", "src/a.ts"),
+            ("src/**/*.tsx", "src/ui/*.tsx"),
+        ]:
+            with self.subTest(pair=(a, b)):
+                self.assertIn(overlap_kind(a, b), {"definite", "possible"})
+                self.assertIn(overlap_kind(b, a), {"definite", "possible"})
+
+    def test_a_concrete_path_under_a_glob_is_actually_covered(self) -> None:
+        """Pin the real answer for the simplest case, so the guard above
+        cannot pass on a constant."""
+        self.assertEqual(overlap_kind("src/**", "src/ui/x.ts"), "possible")
+        self.assertEqual(overlap_kind("src/ui", "src/ui/x.ts"), "definite")
 
 
 class TestPlanScopes(unittest.TestCase):
