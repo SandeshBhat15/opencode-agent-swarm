@@ -55,13 +55,39 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        # mkstemp creates 0600. Run state is not a secret, and silently
+        # owner-only files break a shared checkout or a CI cache that runs as a
+        # different user, so widen before the rename makes it visible.
+        try:
+            os.chmod(tmp, 0o644)
+        except OSError:
+            pass
         os.replace(tmp, path)
+        # fsync the DIRECTORY too. Data without this does not make the rename
+        # durable: on POSIX a crash can lose the directory entry and the write
+        # silently reverts. Best effort — Windows has no equivalent to fsync a
+        # directory handle, and the call is a no-op there.
+        _fsync_dir(path.parent)
     except BaseException:
         try:
             tmp.unlink()
         except OSError:
             pass
         raise
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Flush a directory entry so a completed rename survives a crash."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -233,6 +259,13 @@ def init_run(workspace: Path, slug: str) -> Path:
     ):
         if not (run_dir / name).exists():
             atomic_write_text(run_dir / name, header)
+    # Keep the run dir out of version control. evidence.jsonl holds raw command
+    # output verbatim, and that output can contain secrets; without this the
+    # run dir sits inside the workspace where `git add -A` will happily stage
+    # it. Same trick create_worktrees uses for its tree root.
+    ignore = runs_root(workspace) / ".gitignore"
+    if not ignore.exists():
+        atomic_write_text(ignore, "*\n")
     atomic_write_json(run_dir / CRITERIA_FILE, [])
     atomic_write_text(run_dir / EVIDENCE_FILE, "")
     return run_dir
@@ -270,15 +303,20 @@ def find_run(workspace: Path, slug: str) -> Path:
 
     Rule 3 raises rather than guessing when several runs match, because
     silently picking one would resume the wrong run.
+
+    A slug containing ``..`` resolves outside the run root. Rules 1 and 2 are
+    the paths that make that reachable, so every return goes through
+    :func:`_confined` - checking only the suffix match left the exact branch
+    able to hand back (and then write state into) an outside directory.
     """
     root = runs_root(workspace)
     exact = root / slug
     if (exact / STATE_FILE).exists():
-        return exact
+        return _confined(exact, root)
 
     dated = root / f"{utcnow()[:10]}-{slug}"
     if (dated / STATE_FILE).exists():
-        return dated
+        return _confined(dated, root)
 
     matches = sorted(
         p
@@ -286,7 +324,7 @@ def find_run(workspace: Path, slug: str) -> Path:
         if p.name.endswith(f"-{slug}") or _read_slug(p) == slug
     )
     if len(matches) == 1:
-        return matches[0]
+        return _confined(matches[0], root)
     if len(matches) > 1:
         names = ", ".join(p.name for p in matches)
         raise SwarmError(
@@ -295,6 +333,25 @@ def find_run(workspace: Path, slug: str) -> Path:
             code="AMBIGUOUS_RUN",
         )
     raise SwarmError(f"no run {slug!r} under {root}", code="NO_SUCH_RUN")
+
+
+def _confined(run_dir: Path, root: Path) -> Path:
+    """Assert a resolved run dir really is inside the run root.
+
+    ``--slug`` containing `..` resolved to a directory outside
+    ``.opencode/swarm`` when that directory happened to hold a state.json, and
+    the next ``store.mutation`` then wrote a state file into it. Nothing in the
+    resolution chain was checking containment, so it is checked here, once,
+    after every resolution strategy has run.
+    """
+    resolved = Path(run_dir).resolve()
+    anchor = Path(root).resolve()
+    if resolved != anchor and anchor not in resolved.parents:
+        raise SwarmError(
+            f"run path {resolved} is outside {anchor}; refusing to touch it",
+            code="RUN_OUTSIDE_ROOT",
+        )
+    return run_dir
 
 
 def _read_slug(run_dir: Path) -> str:
@@ -419,25 +476,28 @@ def file_lock(path: Path, *, timeout: float = LOCK_WAIT_SECONDS,
     over, so a crash cannot wedge the run forever.
 
     Raises ``LockError`` (``LOCK_HELD``) if the lock is still held after the
-    timeout, or ``LOCK_STALE`` if an existing lock file is unreadable.
+    timeout.
+
+    A stale lock is only taken over after its recorded pid is checked with
+    ``os.kill(pid, 0)``: a live holder is never evicted, even if its critical
+    section ran longer than ``stale_after``. The releasing process also
+    unlinks **only the inode it created**, so a slow original holder cannot
+    delete the lock a new holder is already using.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + max(0.0, timeout)
+    mine: tuple[int, int] | None = None
     while True:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
+            if _evict_if_dead(path, stale_after):
+                continue
             try:
                 age = time.time() - path.stat().st_mtime
             except OSError:
                 age = stale_after  # unreadable stat: treat as stale, not fresh
-            if age >= stale_after:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-                continue
             if time.monotonic() >= deadline:
                 raise LockError(
                     f"{path.name} is locked by another process (age {age:.0f}s) "
@@ -449,14 +509,113 @@ def file_lock(path: Path, *, timeout: float = LOCK_WAIT_SECONDS,
             continue
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(f"pid={os.getpid()} at={utcnow()}\n")
+        try:
+            st = path.stat()
+            mine = (st.st_dev, st.st_ino)
+        except OSError:
+            mine = None
         break
     try:
         yield
     finally:
+        # Unlink by identity, not by name. If a takeover replaced the lock while
+        # this holder was running, a bare `path.unlink()` would free the NEW
+        # holder's lock and let a third process enter concurrently (ABA).
+        try:
+            st = path.stat()
+            if mine is None or (st.st_dev, st.st_ino) == mine:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if ``pid`` still exists. Best effort and never raises.
+
+    Platform split matters here. On POSIX ``os.kill(pid, 0)`` is the standard
+    existence probe. **On Windows it is not**: ``os.kill`` maps any signal
+    other than the two console events straight onto ``TerminateProcess``, so
+    calling it with 0 would *kill* the process we are trying to inspect. This
+    function is on the path that decides whether to steal another process's
+    lock, so a wrong answer there means killing an unrelated process. Use the
+    kernel query instead.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
+                return True  # cannot tell: assume alive rather than evict
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return True  # cannot tell: assume alive rather than evict
+    return True
+
+
+def _evict_if_dead(path: Path, stale_after: float) -> bool:
+    """Remove an abandoned lock. Returns True if the caller should retry.
+
+    Two guards stop this from evicting a live holder:
+
+    * age >= ``stale_after`` — the usual stale criterion; and
+    * the recorded pid is gone — checked with ``os.kill(pid, 0)``.
+
+    The pid check is what makes a takeover safe when a critical section simply
+    ran longer than ``stale_after``: mtime alone would evict a healthy holder.
+    """
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return True  # unreadable stat: treat as abandoned
+    if age < stale_after:
+        return False
+    try:
+        recorded = path.read_text(encoding="utf-8")
+    except OSError:
+        recorded = ""
+    pid_text = ""
+    for part in recorded.split():
+        if part.startswith("pid="):
+            pid_text = part[4:]
+            break
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        # No usable pid: fall back to the age criterion alone. The unlink must
+        # happen here too — returning before it would re-check the same live
+        # file forever and spin the acquisition loop until it was killed.
         try:
             path.unlink()
         except OSError:
             pass
+        return True
+    if _pid_alive(pid):
+        return False  # holder is alive, however long it has held the lock
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return True
 
 
 @contextmanager
@@ -472,16 +631,24 @@ def _exclusive_lock(rundir: Path) -> Iterator[None]:
 
 
 def recover(rundir: Path, note: str) -> dict[str, Any]:
-    """Clear an interrupted-mutation journal after human reconciliation."""
+    """Clear an interrupted-mutation journal after human reconciliation.
+
+    The directory lock is taken **before** anything is removed. Without that,
+    an operator running `swarm run recover` while a `swarm run phase` is
+    mid-mutation deleted the live holder's lock AND its journal; the holder
+    then finished having written nothing, which is precisely the state
+    `require_clean` exists to catch and which a later run would trust.
+    """
     rundir = Path(rundir)
     entry = pending_journal(rundir) or {}
-    lock = rundir / LOCK_FILE
-    if lock.exists():
-        lock.unlink()
-    try:
-        journal(rundir).unlink()
-    except FileNotFoundError:
-        pass
+    with file_lock(rundir / LOCK_FILE, timeout=0.0):
+        # Only unlink what is actually there; a file that vanishes between the
+        # check and the unlink must not escape as an uncaught FileNotFoundError.
+        for victim in (rundir / LOCK_FILE, journal(rundir)):
+            try:
+                victim.unlink()
+            except FileNotFoundError:
+                pass
     append_line(
         rundir / HISTORY_FILE,
         f"{now_hhmm()} recover — {note} (interrupted op: {entry.get('op', 'unknown')}"

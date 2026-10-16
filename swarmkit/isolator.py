@@ -21,7 +21,7 @@ import fnmatch
 import re
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Iterable
 
 from .errors import ScopeConflict, SwarmError
@@ -75,6 +75,7 @@ def split_scope(raw: str | Iterable[str]) -> list[str]:
 
 def validate_entry(entry: str, *, allow_self_protected: bool = False) -> None:
     """Reject escape hatches and protected trees inside a FILE BOUNDARY."""
+    raw = entry
     entry = normalise(entry)
     if entry in ("", "*", "**", "**/*"):
         raise ScopeConflict(
@@ -84,6 +85,16 @@ def validate_entry(entry: str, *, allow_self_protected: bool = False) -> None:
     if ".." in entry.split("/"):
         raise ScopeConflict(
             f"scope entry {entry!r} escapes the workspace via '..'",
+            code="SCOPE_ESCAPE",
+        )
+    # An absolute path is a claim about somewhere outside the workspace. It was
+    # previously accepted: `..` was checked but `/etc/passwd` and `C:/Windows`
+    # were not, so the module whose whole job is vetting FILE BOUNDARY claims
+    # waved them through.
+    if raw.startswith(("/", "\\")) or PurePath(raw).is_absolute():
+        raise ScopeConflict(
+            f"scope entry {raw!r} is an absolute path; a FILE BOUNDARY names "
+            "paths inside the workspace",
             code="SCOPE_ESCAPE",
         )
     head = entry.split("/")[0]
@@ -134,7 +145,17 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
             out.append(re.escape(ch))
         i += 1
     out.append("$")
-    return re.compile("".join(out))
+    try:
+        return re.compile("".join(out))
+    except re.error as exc:
+        # `[]`, `[z-a]` and friends are not valid globs. Left alone they raised
+        # re.PatternError out of cmd_scope_plan as an uncaught traceback,
+        # because main() only catches SwarmError. Refuse them like any other
+        # bad scope.
+        raise ScopeConflict(
+            f"scope entry {pattern!r} has an unparseable character class: {exc}",
+            code="BAD_PATTERN",
+        ) from None
 
 
 def _literal_prefix(entry: str) -> str:
@@ -371,7 +392,14 @@ def worktree_patch(repo: Path, wt_path: Path, *, base: str | None = None) -> str
     # Diff from inside the worktree, not the main checkout: we want this
     # workstream's HEAD, and `base` still resolves because worktrees share
     # the object database and refs.
-    proc = _git(Path(wt_path), "diff", "--binary", f"{base}...HEAD", "--", check=False)
+    #
+    # `--end-of-options` stops git parsing the revspec as an OPTION. Without
+    # it, `--base '--output=/tmp/PWNED'` became the argv element
+    # "--output=/tmp/PWNED...HEAD", git wrote a file at the attacker's path and
+    # returned an empty diff, which this function reported as a successful
+    # 0-byte patch. argv injection, not shell injection — but just as real.
+    proc = _git(Path(wt_path), "diff", "--binary",
+                "--end-of-options", f"{base}...HEAD", "--", check=False)
     if proc.returncode != 0:
         raise SwarmError(
             f"could not diff worktree {wt_path}: {(proc.stderr or proc.stdout).strip()}",

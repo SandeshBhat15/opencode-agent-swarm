@@ -1,16 +1,21 @@
 # Swarm agent-page CHANGELOG
 
-Auto-applied minimal edits to `agents/swarm/*.md` by `swarm/improve`. Orchestrator (`agents/swarm.md`) changes are NEVER listed here — they require user approval.
+This file records **user-approved** changes to the five subagent pages. `swarm/improve` is
+propose-only: it never writes to this file or to any agent page on its own. Changes to the
+orchestrator (`agents/swarm.md`) are NEVER listed here — they require separate explicit approval.
+
+Earlier revisions of this file were written by an auto-applying step that could rewrite
+`qc.md` itself. That behaviour is removed; see "2026-10-16 — audit" below.
 
 ## 2026-10-16 — run `2026-10-16-diwali-web-ar`
 
 ### `agents/swarm/researcher.md`
-- **Before:** frontmatter carried `model: tokenharbor/claude-haiku-5.5:free` (3rd line of frontmatter)
+- **Before:** frontmatter carried `model: tokenharbor/claude-haiku-5.5#free` (3rd line of frontmatter)
 - **After:** the `model:` line is deleted; the agent inherits the session's live default model
 - **Reason:** both researcher spawns (W1 + W2) died at spawn with "free offer ended" — a durable page-level pin against a volatile free-tier offer. Rerouting to `general` executors with the contract pasted inline worked 2/2. Note: the model catalog still reports this model as `status: active`, so catalog status is not spawnable-proof and re-pinning would have reproduced the failure.
 
 ### `agents/swarm/qc.md`
-- **Before:** frontmatter carried `model: tokenharbor/deepseek-v4-flash:free` (3rd line of frontmatter)
+- **Before:** frontmatter carried `model: tokenharbor/deepseek-v4-flash#free` (3rd line of frontmatter)
 - **After:** the `model:` line is deleted; the agent inherits the session's live default model
 - **Reason:** the QC spawn died at spawn — "does not accept image input" — on a text-only prompt, a capability-routing check the hardcoded pin bypassed. Reroute to a `general` executor produced a real verdict (PASS).
 - **Also, line 25:** "You run on a deliberately DIFFERENT model than the builders" → "Assume you run on a deliberately DIFFERENT model than the builders" (1 sentence). With the pin gone the original assertion was no longer guaranteed true; the intent (think independently, adversarially) is preserved. The frontmatter `description` still says "on a deliberately different model" to keep that selection intent visible to the orchestrator.
@@ -25,7 +30,8 @@ Auto-applied minimal edits to `agents/swarm/*.md` by `swarm/improve`. Orchestrat
 
 ### `agents/swarm/improve.md` — NO EDIT
 - **Before/After:** unchanged
-- **Reason:** its own pin (`tokenharbor/deepseek-v4.1-flash:free`) spawned fine this run; it is a `:free` pin of the same fragile class and should be unpinned at the next opportunity if it ever fails at spawn.
+- **Reason:** its `model:` pin was removed during the 2026-10-16 audit (see that entry), not
+  during the `diwali-web-ar` run. This run produced no change to the page.
 
 ## 2026-10-16 — protocol v1.2 (orchestrator, user-directed)
 

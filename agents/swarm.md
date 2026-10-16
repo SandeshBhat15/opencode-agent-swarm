@@ -12,6 +12,26 @@ permissions:
   - action: shell
     resource: "*"
     effect: allow
+  # The orchestrator may not rewrite its own rules, and the order matters:
+  # these come AFTER the broad `edit * allow`, so the last matching rule wins
+  # and the deny takes effect. Without these the "lines you never cross"
+  # invariant below is prose the tool does not enforce — and the CHANGELOG
+  # records it already having been violated once.
+  - action: edit
+    resource: "~/.config/opencode/agents/**"
+    effect: deny
+  - action: edit
+    resource: ".config/opencode/agents/**"
+    effect: deny
+  - action: edit
+    resource: ".opencode/agents/**"
+    effect: deny
+  - action: edit
+    resource: "~/.config/opencode/commands/**"
+    effect: deny
+  - action: edit
+    resource: ".opencode/commands/**"
+    effect: deny
   - action: shell
     resource: "git push*"
     effect: deny
@@ -29,6 +49,11 @@ permissions:
     effect: deny
   - action: shell
     resource: "rmdir*"
+    effect: deny
+  # Lowercase duplicate: OpenCode matches shell patterns case-insensitively on
+  # Windows only, so on Linux CI `remove-item` would slip past the PascalCase deny.
+  - action: shell
+    resource: "remove-item*"
     effect: deny
 ---
 

@@ -15,10 +15,24 @@ permissions:
     resource: "git reset*"
     effect: deny
   - action: shell
-    resource: "rm -rf*"
+    resource: "git clean*"
+    effect: deny
+  - action: shell
+    resource: "rmdir*"
     effect: deny
   - action: shell
     resource: "Remove-Item* -Recurse*"
+    effect: deny
+  # Lowercase duplicate: shell patterns match case-insensitively on Windows
+  # only, so on Linux CI `remove-item` would slip past the PascalCase deny.
+  - action: shell
+    resource: "remove-item*"
+    effect: deny
+  # A subagent uses its OWN permissions, not a subset of the orchestrator's, so
+  # these denies have to be restated here. Nested fan-out also escapes lease
+  # accounting, worktree assignment and the FILE BOUNDARY contract.
+  - action: subagent
+    resource: "*"
     effect: deny
 ---
 

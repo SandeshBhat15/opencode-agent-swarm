@@ -418,6 +418,24 @@ def cmd_workers_finish(args: argparse.Namespace) -> int:
                  f"{args.name} finished {args.state}")
 
 
+def cmd_workers_progress(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
+    # Registry.progress takes COUNTERS_LOCK with a bounded wait itself. It must
+    # NOT use store.mutation: that lock is fail-fast by design (a phase change
+    # must not queue behind another), and progress arrives from every live
+    # worker at once, so a fail-fast lock would drop most updates on the floor.
+    worker = workers.Registry(run_dir).progress(
+        args.name, args.epoch, units=args.units
+    )
+    return _emit(
+        {"name": worker.name, "attempt": worker.attempt,
+         "progress": worker.progress, "beats": worker.beats},
+        args.json,
+        f"progress {worker.name} attempt {worker.attempt} "
+        f"({worker.progress} total, {worker.beats} beats)",
+    )
+
+
 def cmd_workers_status(args: argparse.Namespace) -> int:
     run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
     status = workers.Registry(run_dir).status(stale_seconds=args.stale)
@@ -430,9 +448,31 @@ def cmd_workers_status(args: argparse.Namespace) -> int:
         or "no workers registered"
     ) + (
         f"\nalive={status['alive']} slow={status['slow']} "
-        f"stale={status['stale']} timeout={status['timed_out']}"
+        f"wedged={status['wedged']} stale={status['stale']} "
+        f"timeout={status['timed_out']}"
     )
     return _emit(status, args.json, human)
+
+
+def cmd_workers_reconcile(args: argparse.Namespace) -> int:
+    """Idempotently make registry, budget and evidence agree.
+
+    A worker can die at four points, and each leaves a different mess:
+
+    1. after ``spawn`` leased it, before it ever ran  -> lease held, no work
+    2. while it was running                          -> lease held, stale beat
+    3. after it wrote its result, before ``finish``   -> work done, slot held
+    4. after ``finish`` but before the run resumed     -> nothing to do
+
+    Running this twice must be a no-op the second time, so it may be called
+    freely on resume instead of a human deciding which case they are in.
+    """
+    run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
+    report = workers.reconcile(run_dir, limits=_limits_from(args, run_dir),
+                               stale_seconds=args.stale)
+    return _emit(report, args.json,
+                 f"reconciled: released {len(report['released'])}, "
+                 f"already consistent {len(report['consistent'])}")
 
 
 def cmd_workers_reclaim(args: argparse.Namespace) -> int:
@@ -443,6 +483,7 @@ def cmd_workers_reclaim(args: argparse.Namespace) -> int:
         limits=_limits_from(args, run_dir),
         stale_seconds=args.stale,
         names=args.name,
+        include_wedged=args.include_wedged,
     )
     reclaimed = ", ".join(
         f"{r['name']}({r['liveness']},attempt {r['attempt']})" for r in report["reclaimed"]
@@ -551,8 +592,27 @@ def cmd_iso_patch(args: argparse.Namespace) -> int:
 
 
 def cmd_iso_integrate(args: argparse.Namespace) -> int:
+    """Resolve `--ws` through the manifest and keep the patch inside it.
+
+    `iso patch` and `iso remove` already routed `--ws` through `_iso_resolve`
+    (manifest-only). This one built the path itself, so `--ws` could be any
+    readable file on disk and it was handed straight to `git apply`. Route it
+    the same way, then assert the resolved patch is inside the tree root.
+    """
     repo = isolator.repo_root(Path(args.repo))
-    patch = Path(args.patch) if args.patch else _iso_trees(args) / f"{args.ws}.patch"
+    trees = _iso_trees(args)
+    if args.patch:
+        patch = Path(args.patch)
+    else:
+        _iso_resolve(trees, args.ws)  # manifest-only: validates the name
+        patch = trees / f"{args.ws}.patch"
+    resolved = Path(patch).resolve()
+    anchor = Path(trees).resolve()
+    if anchor not in resolved.parents and resolved != anchor:
+        raise SwarmError(
+            f"patch {resolved} is outside the worktree root {anchor}",
+            code="PATCH_OUTSIDE_TREES",
+        )
     result = isolator.integrate_patch(repo, patch, three_way=not args.no_three_way)
     human = "applied" if result["applied"] else f"NOT applied: {result['reason']}\n{result['detail']}"
     return _emit(result, args.json, human)
@@ -693,6 +753,11 @@ def build_parser() -> argparse.ArgumentParser:
     wbt = w.add_parser("beat"); wbt.add_argument("--name", "--worker", dest="name", required=True)
     wbt.add_argument("--epoch", required=True); wbt.add_argument("--slug")
     wbt.set_defaults(func=cmd_workers_beat)
+    wpg = w.add_parser("progress")
+    wpg.add_argument("--name", "--worker", dest="name", required=True)
+    wpg.add_argument("--epoch", required=True)
+    wpg.add_argument("--units", type=int, default=1)
+    wpg.add_argument("--slug"); wpg.set_defaults(func=cmd_workers_progress)
     wfi = w.add_parser("finish"); wfi.add_argument("--name", "--worker", dest="name", required=True)
     wfi.add_argument("--epoch", required=True)
     wfi.add_argument("--state", choices=["ok", "failed"], required=True)
@@ -700,7 +765,15 @@ def build_parser() -> argparse.ArgumentParser:
     wfi.set_defaults(func=cmd_workers_finish)
     wrc = w.add_parser("reclaim"); wrc.add_argument("--name", "--worker", dest="name", action="append")
     wrc.add_argument("--stale", type=float, default=workers.DEFAULT_STALE_SECONDS)
+    wrc.add_argument("--include-wedged", action="store_true",
+                     help="also reclaim workers that are alive but not advancing "
+                          "(off by default: a wedged worker may be a slow but "
+                          "legitimate long task)")
     wrc.add_argument("--slug"); wrc.set_defaults(func=cmd_workers_reclaim)
+
+    wrn = w.add_parser("reconcile")
+    wrn.add_argument("--stale", type=float, default=workers.DEFAULT_STALE_SECONDS)
+    wrn.add_argument("--slug"); wrn.set_defaults(func=cmd_workers_reconcile)
 
     sc = sub.add_parser("scope").add_subparsers(dest="cmd", required=True)
     sp = sc.add_parser("plan"); sp.add_argument("--ws", action="append", required=True)

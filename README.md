@@ -16,7 +16,7 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
 | **2 commands** | `/swarm <task>` and `/swarm-status` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 243 tests, no network, no API spend |
+| **`tests/`** | 285 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -94,8 +94,8 @@ Every prompt takes exactly one lane:
 | Lane | When | Path |
 |---|---|---|
 | **R1** trivial | question, explanation, snippet | answer in chat, no ceremony |
-| **R2** research | the deliverable is knowledge | fan out `researcher`s in parallel |
-| **R3** small build | ≤2 files, no protected paths | one `builder`, verify, deliver |
+| **R2** research | the deliverable is knowledge | fan out `swarm/researcher`s in parallel |
+| **R3** small build | ≤2 files, no protected paths | one `swarm/builder`, verify, deliver |
 | **R4** project | everything else | full pipeline |
 
 R2–R4 still fire RETRO so lessons accumulate. R1 only does when the answer is worth remembering.
@@ -247,7 +247,7 @@ rather than becoming an archive.
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 243 tests
+python -m unittest discover -s tests -t .     # 285 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
 python -m swarmkit selftest                   # quick end-to-end gate check
 ```
@@ -299,10 +299,36 @@ python -m swarmkit workers spawn  --name build --role builder --timeout 900
 #  -> {"worker": {"name":"build","attempt":1,"epoch":"9f2c..."}, "retry_delay": 2.0, ...}
 
 python -m swarmkit workers beat   --name build --epoch 9f2c...   # every ~30s
-python -m swarmkit workers status                              # alive/slow/stale/timeout per worker
+python -m swarmkit workers progress --name build --epoch 9f2c... --units 1
+python -m swarmkit workers status                              # alive/slow/wedged/stale/timeout
 python -m swarmkit workers finish --name build --epoch 9f2c... --state ok
 python -m swarmkit workers reclaim                            # frees only stale/timeout slots
+python -m swarmkit workers reconcile                         # after a crash - see below
 ```
+
+`workers progress` records forward movement. It matters because a heartbeat
+only proves the worker is *breathing*, not that it is *advancing*: a task stuck
+in a retry loop beats happily forever. `classify` reports **wedged** when a
+worker has beaten recently but reported no progress for
+`DEFAULT_PROGRESS_STALE_SECONDS` (600s). The guard that stops this from killing
+legitimate long work is that wedging requires evidence of a spin — a worker that
+has reported no progress *at all* is never called wedged, and reclaiming one
+still needs an explicit `--include-wedged`, because a wedged worker is provably
+alive and only unproductive.
+
+`workers reconcile` is crash recovery for the state the lifecycle cannot reach
+by itself. If a worker dies between `finish` and `release`, or after spawning
+but before running, the slot is orphaned and the run eventually deadlocks on
+`CONCURRENCY_LIMIT`. `reconcile` walks the registry against the leases and
+releases what cannot be alive, matching a worker's results back to it through
+the criterion's `workstream`. It is idempotent: running it twice releases
+nothing the second time.
+
+**Lock policy.** State-phase mutations (`run phase`) take the fail-fast lock and
+refuse rather than queue. Registry and counter writes (`spawn`, `reclaim`,
+`reconcile`, `progress`) take a bounded-wait lock, because several workers beat
+at once and dropping all but the first would lose their progress. A lock whose
+recorded pid is still alive is never stolen, however old its timestamp.
 
 - **`--epoch` is an ownership token.** A worker reclaimed and respawned gets a *new* epoch; the old
   one's `beat`/`finish` is refused with `EPOCH_MISMATCH`. A zombie cannot resurrect itself and a

@@ -11,6 +11,11 @@ permissions:
   - action: shell
     resource: "git*"
     effect: deny
+  # Nested fan-out would let the retrospectives agent spawn workers that never
+  # appear in `workers status` and never carry a lease.
+  - action: subagent
+    resource: "*"
+    effect: deny
 ---
 
 You are the SELF-IMPROVEMENT unit of the agent swarm. You run after every delivery — and after escalation-aborted runs too, because failures teach more. The orchestrator hands you: the run slug, phase timeline, what broke, escalations, and its own impressions.

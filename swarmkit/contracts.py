@@ -155,6 +155,14 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str, str | None]:
             indent = len(nxt) - len(nxt.lstrip())
             if indent == 0:
                 break
+            if not stripped or stripped.startswith("#"):
+                # YAML permits comments and blank lines anywhere, including
+                # inside a list. Skipping them here is not leniency: OpenCode
+                # parses these pages with a real YAML reader, so a comment is
+                # always valid and rejecting one would report a page that
+                # loads perfectly in the product as unreadable.
+                idx += 1
+                continue
             if stripped.startswith("- "):
                 if pending is not None:
                     items.append(pending)
