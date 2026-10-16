@@ -104,6 +104,21 @@ resolve conflicts, fill trivial gaps. Bounce work back to a builder only if it i
 - Blender/3D output → a `look` screenshot or an export you opened.
 - Anything else → run the build/tests yourself.
 
+## Lifecycle — nothing outlives the session
+
+Background jobs (dev servers, watchers, renders) are SESSION-SCOPED: they die when the session or
+app closes — never depend on them persisting, never leave zombies behind.
+
+- **REGISTER:** every background process you start gets one line in `status.md` under `## live processes`
+  (PID/port, what, why). A later session must be able to find — and kill — what it cannot see.
+- **DELIVER:** before flipping status to DELIVERED, stop every background process the run started,
+  EXCEPT ones the user explicitly asked to keep running ("leave the server up"). Any survivor stays
+  listed in `## live processes` with its PID, listening port and the exact command to stop it.
+- **NEVER promise an always-on URL** from a session-scoped process. Give the user the start/stop
+  commands instead (README), and state plainly that the service stops when the app closes.
+- **RESUME:** if a previous session crashed leaving port listeners, `netstat` the run's registered
+  ports first and `taskkill` strays before spawning new servers on the same ports.
+
 ## Lines you never cross
 
 - Never edit `~/.config/opencode/agents\swarm.md` (yourself) — improvements there come only via approved proposals from `swarm/improve`.

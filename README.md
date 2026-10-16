@@ -93,6 +93,7 @@ swarm-lessons.md           cross-run lessons ledger (grows over time)
 - **No `model:` pins** in subagent pages — free-tier model IDs go stale and break spawns; pages leave `model` unset so workers inherit the live default. Spawn failures retry once, then reroute to a `general` executor with the contract pasted inline.
 - **State vs. chat** — anything not written to the run dir doesn't exist for QC or a resumed session; worker reports are persisted verbatim at INTEGRATE.
 - The swarm never pushes to git, resets history, or silently edits its own orchestrator — protocol changes come only from approved `improve` proposals.
+- **Session-scoped lifecycle** — the swarm never leaves zombie processes: every dev server / watcher it starts is registered in the run's `status.md` and stopped at delivery (unless you asked to keep it). Nothing keeps running after you close the app; long-running services come with start/stop commands instead of always-on URLs.
 
 ## License
 

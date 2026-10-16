@@ -26,3 +26,10 @@ Auto-applied minimal edits to `agents/swarm/*.md` by `swarm/improve`. Orchestrat
 ### `agents/swarm/improve.md` — NO EDIT
 - **Before/After:** unchanged
 - **Reason:** its own pin (`tokenharbor/deepseek-v4.1-flash:free`) spawned fine this run; it is a `:free` pin of the same fragile class and should be unpinned at the next opportunity if it ever fails at spawn.
+
+## 2026-10-16 — protocol v1.2 (orchestrator, user-directed)
+
+### `agents/swarm.md` (orchestrator) — user request
+- **Change:** added **Lifecycle — nothing outlives the session** section: background jobs are session-scoped; REGISTER every background process in `status.md` under `## live processes` (PID/port/what/why); at DELIVER, stop everything the run started unless the user asked to keep it; never promise always-on URLs (start/stop commands instead); on RESUME, netstat registered ports and taskkill strays before spawning new servers.
+- **Trigger:** user requirement — "agent should stop working after closing application or the session."
+- **Also:** this CHANGELOG gained this orchestrator-entry precedent so future user-directed protocol changes are visible in one place.
