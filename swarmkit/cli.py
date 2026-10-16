@@ -581,9 +581,32 @@ def cmd_iso_create(args: argparse.Namespace) -> int:
     return _emit({"worktrees": rows, "trees": str(tree_root), "manifest": mapping}, args.json, human)
 
 
+def _iso_confined_wt(args: argparse.Namespace, wt: str | None, ws: str | None) -> Path:
+    """Resolve a worktree path and refuse anything outside the tree root.
+
+    `--ws` is validated against the manifest by `_iso_resolve`, but `--wt`
+    bypassed it entirely: `iso remove --wt C:\\...\\precious-wt` removed a
+    registered worktree and destroyed uncommitted work, because
+    `remove_worktree` always passes `git worktree remove --force`. Both CLI
+    entry points that accept a raw `--wt` now go through here.
+    """
+    trees = _iso_trees(args)
+    wt_path = Path(wt) if wt else _iso_resolve(trees, ws)
+    resolved = wt_path.resolve()
+    anchor = Path(trees).resolve()
+    if resolved != anchor and anchor not in resolved.parents:
+        raise SwarmError(
+            f"worktree {resolved} is outside the worktree root {anchor}. "
+            "Pass --ws with a name from the manifest, or point --trees at the "
+            "root that owns it.",
+            code="WORKTREE_OUTSIDE_ROOT",
+        )
+    return wt_path
+
+
 def cmd_iso_patch(args: argparse.Namespace) -> int:
     repo = isolator.repo_root(Path(args.repo))
-    wt_path = Path(args.wt) if args.wt else _iso_resolve(_iso_trees(args), args.ws)
+    wt_path = _iso_confined_wt(args, args.wt, args.ws)
     patch = isolator.worktree_patch(repo, wt_path, base=args.base)
     out = Path(args.out) if args.out else _iso_trees(args) / f"{wt_path.name}.patch"
     store.atomic_write_text(out, patch)
@@ -620,7 +643,7 @@ def cmd_iso_integrate(args: argparse.Namespace) -> int:
 
 def cmd_iso_remove(args: argparse.Namespace) -> int:
     repo = isolator.repo_root(Path(args.repo))
-    wt_path = Path(args.wt) if args.wt else _iso_resolve(_iso_trees(args), args.ws)
+    wt_path = _iso_confined_wt(args, args.wt, args.ws)
     result = isolator.remove_worktree(repo, wt_path)
     return _emit(result, args.json, "removed" if result["removed"] else result["detail"])
 

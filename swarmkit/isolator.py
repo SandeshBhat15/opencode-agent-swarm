@@ -18,6 +18,7 @@ Two failure modes are handled:
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -370,8 +371,28 @@ def create_worktrees(
         ignore.write_text("*\n", encoding="utf-8")
 
     out: list[Worktree] = []
+    root_resolved = tree_root.resolve()
     for name in names:
+        # A workstream name becomes both a path segment and a git ref, so it
+        # has to be a SINGLE segment. `..` and `/` are the traversal primitive:
+        # `tree_root / "../precious-wt"` lands outside the root, and because the
+        # "already exists" branch below skips `git worktree add`, the ref-name
+        # check that would have rejected it never runs.
+        if not name or name in (".", "..") or "/" in name or "\\" in name:
+            raise SwarmError(
+                f"workstream name {name!r} must be a single path segment "
+                "(no '/' , '\\\\', '.' or '..')",
+                code="BAD_WORKSTREAM_NAME",
+            )
         wt_path = tree_root / name
+        # Defence in depth: even with a clean single-segment name, refuse to
+        # register anything that does not resolve to a direct child of the root.
+        if wt_path.resolve().parent != root_resolved:
+            raise SwarmError(
+                f"worktree for {name!r} would resolve to {wt_path.resolve()}, "
+                f"which is outside {root_resolved}",
+                code="WORKTREE_OUTSIDE_ROOT",
+            )
         branch = f"swarm/{name}"
         created = False
         if not wt_path.exists():
@@ -408,6 +429,54 @@ def worktree_patch(repo: Path, wt_path: Path, *, base: str | None = None) -> str
     return proc.stdout
 
 
+def _patch_targets(patch: str) -> list[str]:
+    """Destination paths a patch would write, read from its ``+++`` headers."""
+    targets: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+            if path == "/dev/null":
+                continue
+            # Strip a trailing timestamp column git sometimes appends.
+            path = path.split("\t", 1)[0].strip()
+            if path.startswith(("a/", "b/")):
+                targets.append(path[2:])
+    return targets
+
+
+def _escapes_via_link(repo: Path, rel: str) -> str | None:
+    """Return a reason if ``rel`` traverses a symlink/junction, else ``None``.
+
+    git refuses ``../`` and absolute paths in a patch itself, but it happily
+    follows a directory symlink that already exists inside the working tree: a
+    patch targeting ``link/pwn.txt`` where ``link`` is a junction to
+    ``../outside`` writes *outside* the repo, and git reports success. Windows
+    junctions need no privilege (symbolic links do), so this is reachable by
+    any worker that can create one inside its own scope.
+    """
+    current = repo
+    for part in Path(rel).parts:
+        if part in (".", "..", ""):
+            return None
+        current = current / part
+        if current.is_symlink():
+            return f"{current} is a symlink"
+        # Windows directory junction: reparse point that is not a symlink.
+        if os.name == "nt" and current.exists() and not current.is_dir():
+            return None
+        if os.name == "nt" and current.is_dir():
+            try:
+                st = os.lstat(current)
+            except OSError:
+                return None
+            attrs = getattr(st, "st_file_attributes", 0)
+            reparse = getattr(st, "st_reparse_tag", 0)
+            # IO_REPARSE_TAG_MOUNT_POINT / SYMLINK
+            if attrs & 0x400 or reparse in (0xA0000003, 0xA000000C):
+                return f"{current} is a reparse point (junction/symlink)"
+    return None
+
+
 def integrate_patch(repo: Path, patch_path: Path, *, three_way: bool = True) -> dict[str, Any]:
     """Apply a workstream patch. Refuses to clobber on conflict.
 
@@ -419,6 +488,21 @@ def integrate_patch(repo: Path, patch_path: Path, *, three_way: bool = True) -> 
     repo = repo_root(repo)
     shared: list[str] = ["--3way"] if three_way else []
     target = str(Path(patch_path).resolve())
+
+    # Refuse before git sees it: git will follow an in-tree junction and write
+    # outside the repo while reporting success.
+    try:
+        body = Path(target).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"applied": False, "reason": "patch unreadable", "detail": str(exc)}
+    for rel in _patch_targets(body):
+        escaped = _escapes_via_link(repo, rel)
+        if escaped:
+            return {
+                "applied": False,
+                "reason": "patch target traverses a link out of the repo",
+                "detail": f"{rel}: {escaped}",
+            }
 
     probe = _git(repo, "apply", "--check", *shared, target, check=False)
     if probe.returncode != 0:
