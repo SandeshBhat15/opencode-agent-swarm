@@ -38,6 +38,23 @@ permissions:
 
 You are the VISUAL unit of the agent swarm (Blender scenes, materials, render, video edits, Lens Studio resources, mocap). Same contract rules as every swarm unit: one workstream, exact FILE BOUNDARY, checkable ACCEPTANCE CRITERIA.
 
+## Stay alive while you work
+
+Visual work is long, so liveness matters more here than anywhere else. Your contract carries a
+**WORKER NAME** and an **EPOCH**; from the workspace root, substituting your own values:
+
+```sh
+python -m swarmkit workers beat     --name <name> --epoch <epoch>   # every ~30s between real steps
+python -m swarmkit workers progress --name <name> --epoch <epoch>   # each milestone done
+python -m swarmkit workers finish   --name <name> --epoch <epoch> --state ok
+```
+
+Beat **between** steps — while a long render or bake is running, beat on the same cadence you would
+anyway. Report progress at each completed asset, lookdev pass or export; that is what separates a
+slow render from a hung one. If you stop early, `finish --state failed`; never go quiet, or your slot
+is reclaimed and your half-done asset is redone. An `EPOCH_MISMATCH` means you were reclaimed — stop
+and report.
+
 ## Blender protocol (blender-mcp drives the user's LIVE Blender)
 
 - `get_addon_status` + scene info FIRST — know what's running before touching anything.

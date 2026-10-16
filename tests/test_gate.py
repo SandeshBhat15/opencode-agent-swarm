@@ -18,6 +18,75 @@ def ev_pass(cid: str, cmd: str = "npm run build", result: str = "exit 0") -> Evi
     return Evidence(criterion=cid, status=gate_mod.PASS, command=cmd, result=result)
 
 
+class TestSupersededAttemptsCannotOverwrite(TempWorkspace):
+    """evidence.jsonl is append-only, so a reclaimed worker can still append
+    after its replacement finished. Judged by recency alone the zombie's late
+    line wins, which lets a dead attempt overwrite a live one -- or lets a
+    dead attempt's PASS mask a live attempt's FAIL."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        add_criterion(self.ws, crit("c"))
+
+    def test_a_zombie_fail_cannot_overwrite_a_live_pass(self) -> None:
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.PASS,
+                                       result="attempt 2 ok", worker="w", attempt=2))
+        # The dead attempt 1 appends LATER, chronologically newest.
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.FAIL,
+                                       result="attempt 1 exploded", worker="w", attempt=1))
+        self.assertTrue(evaluate(self.ws).open,
+                        "the superseded attempt must not decide the gate")
+
+    def test_a_live_fail_is_not_masked_by_an_earlier_pass(self) -> None:
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.PASS,
+                                       result="attempt 1 ok", worker="w", attempt=1))
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.FAIL,
+                                       result="attempt 2 broke", worker="w", attempt=2))
+        self.assertFalse(evaluate(self.ws).open,
+                         "the newest attempt is the one that counts")
+
+    def test_attempt_filtering_is_scoped_to_one_worker(self) -> None:
+        """The filter must drop a worker's superseded attempts WITHOUT
+        touching another worker's evidence.
+
+        Note what is deliberately NOT asserted: that a later pass from worker
+        `a` cancels an earlier fail from worker `b`. That is the pre-existing,
+        documented rule -- "the most recent decisive check wins" -- because a
+        legitimate re-run has to be able to clear an earlier failure. Two
+        workers claiming the same criterion is a planning defect, not
+        something the gate should adjudicate.
+        """
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.FAIL,
+                                       result="b attempt 1 broke", worker="b", attempt=1))
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.FAIL,
+                                       result="a attempt 1 ok-ish", worker="a", attempt=1))
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.PASS,
+                                       result="a attempt 2 ok", worker="a", attempt=2))
+        result = evaluate(self.ws)
+        # a's attempt 2 is the last decisive check, so the documented
+        # "most recent wins" rule opens the gate. What the fix guarantees is
+        # that a's SUPERSEDED attempt 1 line was filtered out before the
+        # decision was made.
+        self.assertTrue(result.open)
+        rendered = result.render()
+        self.assertIn("a attempt 2 ok", rendered)
+        self.assertNotIn("a attempt 1", rendered)
+
+    def test_unattributed_evidence_is_untouched(self) -> None:
+        """No worker means a human, or an older file. It must still count."""
+        add_evidence(self.ws, Evidence(criterion="c", status=gate_mod.FAIL,
+                                       result="manual check failed"))
+        self.assertFalse(evaluate(self.ws).open)
+
+    def test_latest_attempts_ignores_partial_attribution(self) -> None:
+        items = [
+            Evidence(criterion="c", status=gate_mod.PASS, worker="w", attempt=2),
+            Evidence(criterion="c", status=gate_mod.PASS, worker="w"),
+            Evidence(criterion="c", status=gate_mod.PASS, worker="x", attempt=1),
+        ]
+        self.assertEqual(gate_mod.latest_attempts(items), {"w": 2, "x": 1})
+
+
 class TestCriteria(TempWorkspace):
     def test_add_and_load(self) -> None:
         run = self.make_run()

@@ -20,6 +20,17 @@ permissions:
 
 You are the SELF-IMPROVEMENT unit of the agent swarm. You run after every delivery — and after escalation-aborted runs too, because failures teach more. The orchestrator hands you: the run slug, phase timeline, what broke, escalations, and its own impressions.
 
+## Stay alive while you work
+
+```sh
+python -m swarmkit workers beat     --name <name> --epoch <epoch>   # every ~30s
+python -m swarmkit workers progress --name <name> --epoch <epoch>   # each lesson promoted or proposed
+python -m swarmkit workers finish   --name <name> --epoch <epoch> --state ok
+```
+
+RETRO runs after the work is done and can still take a while. If you stop early, `finish --state
+failed` rather than going quiet, so the orchestrator does not reclaim the slot and re-run you.
+
 ## Paths
 
 - Run states (workspace): `.opencode/swarm/<run-slug>/` — read plan/history/status there first.

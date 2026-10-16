@@ -205,5 +205,81 @@ class TestRealRepoIsClean(unittest.TestCase):
         self.assertTrue(wildcard_deny, "improve.md must deny edit on * with no page exception")
 
 
+class TestAgentPagesReachEveryCommandTheyNeed(unittest.TestCase):
+    """The orchestrator can only run commands its own pages mention.
+
+    Two rounds of worker-liveness work (heartbeats, progress/wedge detection,
+    lease reclaim, crash reconcile) were unreachable because `agents/swarm.md`
+    still told the orchestrator to use `budget spawn`, which takes a lease but
+    writes no `workers.json` record. Nothing beat, nothing reported progress,
+    nothing reclaimed, and the run deadlocked on CONCURRENCY_LIMIT. The linter
+    passed the whole time: it reads frontmatter, not page bodies.
+
+    So this reads the BODIES. If a mechanism exists in `swarmkit` and the pages
+    never tell the orchestrator to call it, that is a defect, not a doc nit.
+    """
+
+    # subcommand -> the pages that must document it.
+    REQUIRED = {
+        "spawn": ["agents/swarm.md"],
+        "beat": ["agents/swarm.md"],
+        "progress": ["agents/swarm.md"],
+        "finish": ["agents/swarm.md"],
+        "status": ["agents/swarm.md"],
+        "reclaim": ["agents/swarm.md"],
+        "reconcile": ["agents/swarm.md"],
+    }
+
+    # Every spawned worker needs to know how to keep its lease alive.
+    WORKERS_NEEDING_LIVENESS = [
+        "agents/swarm/builder.md",
+        "agents/swarm/researcher.md",
+        "agents/swarm/visual.md",
+        "agents/swarm/qc.md",
+        "agents/swarm/improve.md",
+    ]
+
+    @staticmethod
+    def _body(rel: str) -> str:
+        # Frontmatter is stripped: these assertions are about instructions.
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        parts = text.split("---", 2)
+        return parts[2] if len(parts) == 3 else text
+
+    def test_orchestrator_documents_every_workers_command(self) -> None:
+        body = self._body("agents/swarm.md")
+        for subcommand, pages in self.REQUIRED.items():
+            for rel in pages:
+                with self.subTest(command=subcommand, page=rel):
+                    self.assertIn(
+                        f"workers {subcommand}", body,
+                        f"{rel} never mentions `workers {subcommand}`; "
+                        "the orchestrator cannot run a command it is not told about",
+                    )
+
+    def test_orchestrator_tells_workers_to_keep_beating(self) -> None:
+        body = self._body("agents/swarm.md")
+        for needle in ("--epoch", "EPOCH_MISMATCH", "workers finish"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
+
+    def test_every_worker_page_documents_its_own_liveness(self) -> None:
+        for rel in self.WORKERS_NEEDING_LIVENESS:
+            body = self._body(rel)
+            with self.subTest(page=rel):
+                for needle in ("workers beat", "workers progress", "workers finish"):
+                    self.assertIn(
+                        needle, body,
+                        f"{rel} never mentions `{needle}`; a worker that is not "
+                        "told to beat goes stale and its slot is reclaimed",
+                    )
+
+    def test_the_liveness_contract_reaches_the_delegation_template(self) -> None:
+        """The spawn-time contract is where a worker first learns its epoch."""
+        body = self._body("agents/swarm.md")
+        self.assertIn("LIVENESS:", body)
+        self.assertIn("WORKER NAME:", body)
+
+
 if __name__ == "__main__":
     unittest.main()

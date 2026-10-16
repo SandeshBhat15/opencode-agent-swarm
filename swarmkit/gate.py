@@ -58,6 +58,11 @@ class Evidence:
     result: str = ""
     source: str = ""
     at: str = field(default_factory=utcnow)
+    # Optional provenance. Absent means "not attributable to a worker", which
+    # keeps every pre-existing evidence file valid and keeps a human's manual
+    # `evidence add` working exactly as before.
+    worker: str = ""
+    attempt: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Evidence":
@@ -67,6 +72,11 @@ class Evidence:
                 f"evidence status must be one of {VALID_STATUSES}, got {status!r}",
                 code="BAD_EVIDENCE",
             )
+        attempt_raw = raw.get("attempt")
+        try:
+            attempt = int(attempt_raw) if attempt_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            attempt = None
         return cls(
             criterion=str(raw.get("criterion", "")),
             status=status,
@@ -74,6 +84,8 @@ class Evidence:
             result=str(raw.get("result", "")),
             source=str(raw.get("source", "")),
             at=str(raw.get("at", "")),
+            worker=str(raw.get("worker", "")),
+            attempt=attempt,
         )
 
 
@@ -112,6 +124,23 @@ def add_evidence(run_dir: Path, ev: Evidence) -> Evidence:
     ev.at = ev.at or utcnow()
     append_jsonl(Path(run_dir) / EVIDENCE_FILE, ev.__dict__)
     return ev
+
+
+def latest_attempts(items: list[Evidence]) -> dict[str, int]:
+    """Highest attempt number recorded per worker.
+
+    ``evidence.jsonl`` is append-only, so a worker that was reclaimed and
+    respawned can still append AFTER its replacement finished. Judged purely
+    by recency the zombie's late line is the newest and therefore wins, which
+    lets a dead attempt overwrite a live one. Keying on the attempt number
+    instead means only the newest attempt of each worker is ever decisive.
+    """
+    newest: dict[str, int] = {}
+    for ev in items:
+        if not ev.worker or ev.attempt is None:
+            continue
+        newest[ev.worker] = max(newest.get(ev.worker, 0), ev.attempt)
+    return newest
 
 
 @dataclass
@@ -188,6 +217,15 @@ def evaluate(run_dir: Path) -> GateResult:
     results: list[CriterionResult] = []
     for crit in criteria:
         items = by_criterion.get(crit.id, [])
+        # Drop evidence from superseded attempts. A reclaimed worker can still
+        # append after its replacement finished; without this its stale line
+        # is the newest one and silently overwrites the live result.
+        newest = latest_attempts(items)
+        if newest:
+            items = [
+                e for e in items
+                if not e.worker or e.attempt is None or e.attempt == newest.get(e.worker)
+            ]
         # A `skip` is neither a pass nor a failure: it records that a check was
         # unavailable, which stays visible without pretending either way.
         decisive = [e for e in items if e.status in (PASS, FAIL)]

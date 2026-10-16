@@ -16,7 +16,7 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
 | **2 commands** | `/swarm <task>` and `/swarm-status` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 285 tests, no network, no API spend |
+| **`tests/`** | 294 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -247,7 +247,7 @@ rather than becoming an archive.
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 285 tests
+python -m unittest discover -s tests -t .     # 294 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
 python -m swarmkit selftest                   # quick end-to-end gate check
 ```
@@ -329,6 +329,23 @@ refuse rather than queue. Registry and counter writes (`spawn`, `reclaim`,
 `reconcile`, `progress`) take a bounded-wait lock, because several workers beat
 at once and dropping all but the first would lose their progress. A lock whose
 recorded pid is still alive is never stolen, however old its timestamp.
+
+**`workers spawn` is the real spawn path, not `budget spawn`.** `budget spawn`
+takes a lease but writes no `workers.json` record, so the run cannot see its own
+workers: nothing beats, nothing reports progress, and nothing is reclaimable. The
+agent pages were telling the orchestrator to use it for two rounds of
+worker-liveness work that was therefore unreachable, and `lint` passed the whole
+time because it reads frontmatter, not page bodies. `tests/test_contracts.py`
+now asserts that every `workers` command and every worker's liveness contract
+appears in the page that needs it.
+
+**Evidence carries its provenance.** `evidence.jsonl` is append-only, so a worker
+that was reclaimed and respawned can still append after its replacement finished.
+Judged purely by recency, that zombie's late line is the newest and wins. Each
+evidence entry therefore records `worker` and `attempt`, and the gate ignores any
+attempt that a newer attempt of the same worker has superseded. Entries with no
+worker or attempt - a human running `evidence add`, or an older run - are
+unaffected.
 
 - **`--epoch` is an ownership token.** A worker reclaimed and respawned gets a *new* epoch; the old
   one's `beat`/`finish` is refused with `EPOCH_MISMATCH`. A zombie cannot resurrect itself and a

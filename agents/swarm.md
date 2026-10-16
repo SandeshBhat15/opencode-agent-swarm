@@ -117,7 +117,13 @@ mid-write, the next `run phase` aborts with `RecoveryRequired` and names the exa
 ```
 python -m swarmkit run recover            # clears the journal, appends the recovery to history.md
 python -m swarmkit run list               # find the run; unfinished runs sort first
+python -m swarmkit workers reconcile       # THEN: release slots orphaned by the crash
 ```
+
+Recovering the *state* journal is not the same as recovering the *workers*. A crash can leave a
+worker registered with no lease, or leased with no result — and neither is visible to `require_clean`.
+Run `workers reconcile` after every `run recover`, before trusting `run show`. It is safe to run
+unconditionally and safe to run twice.
 
 `status.md` and `state.json` are written atomically (temp file + fsync + rename), so you never resume
 from a half-written file. Resume is deterministic: `run show` prints the phase, the next action, the
@@ -146,26 +152,68 @@ what `scope plan` accepted.
 
 ```
 AGENT: swarm/<role>
+WORKER NAME: <the --name you passed to `workers spawn`>
+EPOCH: <the epoch `workers spawn` printed>
 OBJECTIVE: <exactly what must exist when you're done>
 OUTPUT FORMAT: <exact deliverable shape>
 TOOLS & SKILLS: <which to use, e.g. "load skill lookdev + rendering", "verify via chrome-devtools">
 FILE BOUNDARY: <only these paths; edit nothing else>
 ACCEPTANCE CRITERIA: <checkable list>
+LIVENESS: beat every ~30s; call `workers progress` at each real milestone; call `workers finish` when done
 REPORT BACK: WHAT / FILES / HOW-VERIFIED / GAPS
 ```
 
+The `LIVENESS` line is not decoration. Without a beat, a worker that is merely slow is
+indistinguishable from one that died holding its slot, and this swarm will reclaim the slot and
+respawn it — duplicating work that was halfway done. Put the epoch in the contract so the worker has
+the token it needs for `beat`, `progress` and `finish`.
+
 Do not make agents re-derive context you already have. Foreground a spawn only when a later decision depends on it.
 
-**Concurrency is enforced, not hoped for.** Lease every slot before you spawn and release it when the
-worker returns. The lease counter refuses over-concurrency and refuses a duplicate worker name, which is
-what stops the same workstream running twice:
+**Concurrency is enforced, not hoped for — but a lease alone is not liveness.**
+`budget spawn` takes a slot and refuses over-concurrency and a duplicate worker name. That stops the
+same workstream running twice, and nothing more: it cannot tell a worker that is working from one
+that died holding its slot. So spawn through `workers spawn`, which takes the same lease *and*
+registers the worker:
 
 ```
 python -m swarmkit budget show
-python -m swarmkit budget spawn --worker build        # refuse if: no slot, or that worker is already live
-python -m swarmkit budget release --worker build     # always release, even when the worker failed
-python -m swarmkit budget retry  --worker build      # max 2 per worker, then reroute to `general`
+python -m swarmkit workers spawn --name build --role builder --timeout 900
+python -m swarmkit workers beat   --name build --epoch <epoch>     # every ~30s while it works
+python -m swarmkit workers progress --name build --epoch <epoch>  # each real milestone
+python -m swarmkit workers finish --name build --epoch <epoch> --state ok
+python -m swarmkit workers status                                # alive / slow / wedged / stale / timeout
+python -m swarmkit workers reclaim                               # frees only stale+timeout slots
+python -m swarmkit workers reconcile                             # after any interruption - see below
 ```
+
+`workers spawn` prints the **epoch**. That token is the worker's identity: hand it to the worker and
+require it back on every `beat`, `progress` and `finish`. A reclaimed worker that comes back with an
+old epoch is refused (`EPOCH_MISMATCH`) instead of resurrecting a dead attempt or double-delivering.
+
+**Report progress, not just presence.** A heartbeat proves the worker is breathing, not that it is
+advancing — a task stuck in a retry loop beats happily forever. Call `workers progress` at each real
+milestone. `workers status` then reports **wedged** for a worker that beats but has reported no
+progress for 600s. It is never called wedged before it has reported any progress at all, and
+reclaiming one still takes an explicit `--include-wedged`: a wedged worker is provably alive and only
+unproductive, so killing it is your decision, not the tool's.
+
+**`budget release` remains for accounting only.** Use `workers finish`, which releases the lease
+*and* records the terminal state. Calling both is harmless; using only `budget spawn`/`release` is
+what leaves a run unable to see its own workers.
+
+**Before resuming any interrupted run, reconcile it:**
+
+```
+python -m swarmkit workers reconcile              # releases slots orphaned by a crash
+python -m swarmkit run list                       # unfinished runs sort first
+```
+
+A crash between `finish` and `release`, or after `spawn` but before the worker ran, orphans the slot
+forever and the run eventually deadlocks on `CONCURRENCY_LIMIT`. `reconcile` walks the registry
+against the leases, releases what cannot be alive, and matches a finished worker's results back to it
+through the criterion's `workstream`. It is idempotent — running it twice releases nothing the second
+time. `workers reclaim` is the narrower sweep: stale and timed-out slots only, never slow or wedged.
 
 **Isolate the writes.** When two workstreams can both reach the working tree, give each its own git
 worktree and integrate deliberately:
@@ -189,9 +237,11 @@ to "the context above". Log the reroute plus the raw error text in `history.md`.
 in an agent page; pass `model` at spawn only when you need a real isolation guarantee (e.g. QC on a
 different model than the builder), and treat `:free` tiers as likely to die mid-run.
 
-**INTEGRATE.** FIRST persist every worker report verbatim into `reports.md` in the run dir — QC and a
-resumed session can only cross-check what is on disk. THEN do the wiring yourself: merge outputs,
-resolve conflicts, fill trivial gaps. Bounce work back to a builder only if it is real building work.
+**INTEGRATE.** FIRST persist every worker report verbatim into `reports.md` in the run dir - QC and a
+resumed session can only cross-check what is on disk. THEN confirm no worker is still holding a slot
+(`workers status`) and close each one out (`workers finish --state ok`) before you wire anything. THEN
+do the wiring yourself: merge outputs, resolve conflicts, fill trivial gaps. Bounce work back to a
+builder only if it is real building work.
 
 **QC.** Spawn `swarm/qc` with: the original user prompt, plan.md, and all workstream outputs. QC runs on a deliberately different model than your builders — use that. Gate on evidence, not claims. On FAIL: send QC's fix orders to the owning builder, re-gate. **Max 2 fix cycles.** Still failing → STOP and escalate to the user with the concrete evidence (file, error, diff). That is the only time you ask outside CLARIFY.
 
