@@ -47,6 +47,7 @@ class TestRunLifecycle(TempWorkspace):
 
     def test_phase_moves_forward(self) -> None:
         run_cli("run", "init", "--slug", "demo", workspace=self.ws)
+        run_cli("run", "phase", "--to", "UNDERSTAND", workspace=self.ws)
         run_cli("run", "phase", "--to", "PLAN", workspace=self.ws)
         state = store.RunState.load(store.find_run(self.ws, "demo"))
         self.assertEqual(state.phase, "PLAN")
@@ -59,12 +60,14 @@ class TestRunLifecycle(TempWorkspace):
 
     def test_status_is_written_on_phase_change(self) -> None:
         run_cli("run", "init", "--slug", "demo", workspace=self.ws)
+        run_cli("run", "phase", "--to", "UNDERSTAND", workspace=self.ws)
         run_cli("run", "phase", "--to", "PLAN", workspace=self.ws)
         status = (store.find_run(self.ws, "demo") / store.STATUS_FILE).read_text(encoding="utf-8")
         self.assertIn("PLAN", status)
 
     def test_abort_is_allowed_from_anywhere(self) -> None:
         run_cli("run", "init", "--slug", "demo", workspace=self.ws)
+        run_cli("run", "phase", "--to", "UNDERSTAND", workspace=self.ws)
         run_cli("run", "phase", "--to", "PLAN", workspace=self.ws)
         proc = run_cli("run", "phase", "--to", "ABORTED", "--reason", "blocked",
                        workspace=self.ws, expect=None)
@@ -84,6 +87,7 @@ class TestInterruptedRunViaCli(TempWorkspace):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("RECOVERY_REQUIRED", (proc.stdout + proc.stderr).upper())
         run_cli("run", "recover", "--note", "reconciled by hand", workspace=self.ws)
+        run_cli("run", "phase", "--to", "UNDERSTAND", workspace=self.ws)
         run_cli("run", "phase", "--to", "PLAN", workspace=self.ws)  # now works
 
     def test_bare_recover_works_and_writes_a_truthful_note(self) -> None:
@@ -115,14 +119,14 @@ class TestGateViaCli(TempWorkspace):
         run_cli("run", "init", "--slug", "gate-demo", workspace=self.ws)
 
     def test_delivery_blocked_with_no_criteria(self) -> None:
-        for phase in ("PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
+        for phase in ("UNDERSTAND", "PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
             run_cli("run", "phase", "--to", phase, workspace=self.ws)
         proc = run_cli("run", "phase", "--to", "DELIVERED", workspace=self.ws, expect=None)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("NO_CRITERIA", (proc.stdout + proc.stderr).upper())
 
     def test_delivery_blocked_when_criterion_unproven(self) -> None:
-        for phase in ("PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
+        for phase in ("UNDERSTAND", "PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
             run_cli("run", "phase", "--to", phase, workspace=self.ws)
         run_cli("criterion", "add", "--id", "build", "--text", "npm run build exits 0",
                 workspace=self.ws)
@@ -131,7 +135,7 @@ class TestGateViaCli(TempWorkspace):
         self.assertIn("GATE_CLOSED", (proc.stdout + proc.stderr).upper())
 
     def test_delivery_allowed_once_verified(self) -> None:
-        for phase in ("PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
+        for phase in ("UNDERSTAND", "PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
             run_cli("run", "phase", "--to", phase, workspace=self.ws)
         run_cli("criterion", "add", "--id", "build", "--text", "npm run build exits 0",
                 workspace=self.ws)
@@ -301,7 +305,7 @@ class TestDocumentedCommandForms(TempWorkspace):
     """
 
     def _to_retro(self) -> None:
-        for phase in ("PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
+        for phase in ("UNDERSTAND", "PLAN", "MESH", "INTEGRATE", "QC", "RETRO"):
             run_cli("run", "phase", phase, workspace=self.ws)
 
     def test_run_init_accepts_goal(self) -> None:
@@ -311,6 +315,7 @@ class TestDocumentedCommandForms(TempWorkspace):
 
     def test_positional_phase_form_advances_and_is_persisted(self) -> None:
         run_cli("run", "init", "--slug", "demo", workspace=self.ws)
+        run_cli("run", "phase", "UNDERSTAND", workspace=self.ws)
         run_cli("run", "phase", "PLAN", workspace=self.ws)
         state = store.RunState.load(store.find_run(self.ws, "demo"))
         self.assertEqual(state.phase, "PLAN")
@@ -337,6 +342,9 @@ class TestDocumentedCommandForms(TempWorkspace):
 
     def test_to_flag_and_positional_must_agree(self) -> None:
         run_cli("run", "init", "--slug", "demo", workspace=self.ws)
+        proc = run_cli("--json", "run", "phase", "UNDERSTAND", "--to", "PLAN",
+                       workspace=self.ws, expect=1)
+        self.assertEqual(json.loads(proc.stdout)["error"]["code"], "BAD_USAGE")
         proc = run_cli("--json", "run", "phase", "PLAN", "--to", "MESH",
                        workspace=self.ws, expect=None)
         self.assertEqual(proc.returncode, 1)
@@ -356,6 +364,7 @@ class TestDocumentedCommandForms(TempWorkspace):
         self.assertEqual(payload["criteria"], [])
         self.assertFalse(payload["gate_open"])
 
+        run_cli("run", "phase", "UNDERSTAND", workspace=self.ws)
         run_cli("run", "phase", "PLAN", workspace=self.ws)
         run_cli("criterion", "add", "--id", "build", "--text", "exits 0", workspace=self.ws)
         payload = json.loads(run_cli("--json", "run", "show", workspace=self.ws).stdout)
@@ -528,7 +537,7 @@ class TestDocumentedClaimsStayTrue(TempWorkspace):
         run_cli("run", "init", "--slug", "cycles", "--goal", "x", workspace=self.ws)
         run_cli("criterion", "add", "--id", "build", "--text", "exits 0",
                 "--slug", "cycles", workspace=self.ws)
-        for phase in ("PLAN", "MESH", "INTEGRATE", "QC"):
+        for phase in ("UNDERSTAND", "PLAN", "MESH", "INTEGRATE", "QC"):
             run_cli("run", "phase", phase, "--slug", "cycles", workspace=self.ws)
 
         # Default max_fix_cycles = 2: two cycles are allowed, the third is not.

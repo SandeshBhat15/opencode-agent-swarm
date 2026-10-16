@@ -19,18 +19,31 @@ FIX = "FIX"
 RETRO = "RETRO"
 DELIVERED = "DELIVERED"
 ABORTED = "ABORTED"
+#: Added by the autonomy round. See ``TRANSITIONS`` for why each is real.
+UNDERSTAND = "UNDERSTAND"
+MONITOR = "MONITOR"
 
 #: Ordered as a run walks them. ``FIX`` is the only phase the run re-enters.
-PHASES: tuple[str, ...] = (INTAKE, PLAN, MESH, INTEGRATE, QC, FIX, RETRO, DELIVERED)
+PHASES: tuple[str, ...] = (
+    UNDERSTAND, PLAN, MESH, MONITOR, INTEGRATE, QC, FIX, RETRO, DELIVERED,
+)
 
 #: Phases a run may never leave.
 TERMINAL: frozenset[str] = frozenset({DELIVERED, ABORTED})
 
 #: Legal edges. ``QC -> FIX -> QC`` is the bounded fix loop.
+#:
+#: ``UNDERSTAND`` and ``MONITOR`` are real phases rather than implied steps.
+#: UNDERSTAND exists so the outcome and its acceptance criteria become a
+#: recorded decision instead of an assumption buried in a prompt; MONITOR
+#: exists so supervision is a checkpoint the run must pass through rather
+#: than something the orchestrator only does if it remembers.
 TRANSITIONS: dict[str, frozenset[str]] = {
-    INTAKE: frozenset({PLAN, ABORTED}),
+    INTAKE: frozenset({UNDERSTAND, ABORTED}),
+    UNDERSTAND: frozenset({PLAN, ABORTED}),
     PLAN: frozenset({MESH, ABORTED}),
-    MESH: frozenset({INTEGRATE, ABORTED}),
+    MESH: frozenset({MONITOR, INTEGRATE, ABORTED}),
+    MONITOR: frozenset({MESH, INTEGRATE, ABORTED}),
     INTEGRATE: frozenset({QC, ABORTED}),
     QC: frozenset({FIX, RETRO, ABORTED}),
     FIX: frozenset({QC, ABORTED}),
@@ -79,9 +92,15 @@ def assert_transition(current: str, nxt: str) -> None:
 
 
 def describe() -> str:
-    """Human-readable transition table for agent pages and docs."""
+    """Human-readable transition table for agent pages and docs.
+
+    INTAKE is listed first even though it is not in PHASES: it is the run's
+    entry state, and iterating PHASES alone printed a table whose first line
+    was UNDERSTAND, leaving the first transition the orchestrator must make
+    undocumented.
+    """
     lines = []
-    for phase in PHASES:
-        targets = sorted(TRANSITIONS[phase])
+    for phase in (INTAKE, *PHASES):
+        targets = sorted(TRANSITIONS.get(phase, ()))
         lines.append(f"{phase:<10} -> {', '.join(targets) if targets else '(terminal)'}")
     return "\n".join(lines)

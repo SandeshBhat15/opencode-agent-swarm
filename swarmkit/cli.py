@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import contracts, gate, isolator, lessons, phases, store, workers
+from . import contracts, gate, isolator, lessons, manager, phases, store, workers
 from .budget import Budget, Limits
 from .errors import SwarmError
 
@@ -45,14 +45,14 @@ def dated_slug(slug: str) -> str:
     return f"{store.utcnow()[:10]}-{slug}"
 
 
-def _emit(payload: dict[str, Any], as_json: bool, human: str = "") -> int:
+def _emit(payload: dict[str, Any], as_json: bool, human: str = "", code: int = 0) -> int:
     if as_json:
         print(json.dumps(payload, indent=2))
     elif human:
         print(human)
     else:
         print(json.dumps(payload, indent=2))
-    return 0
+    return code
 
 
 def _run_dir(workspace: Path, slug: str | None) -> Path:
@@ -69,6 +69,12 @@ def _run_dir(workspace: Path, slug: str | None) -> Path:
 
 def _limits_from(args: argparse.Namespace, run_dir: Path | None = None) -> Limits:
     cfg_path = Path(getattr(args, "config", None) or "swarm.config.json")
+    # An explicit --config is relative to the caller; the default name is
+    # relative to the workspace being operated on. Resolving the default
+    # against the process CWD silently ignored a project's swarm.config.json
+    # whenever the caller ran from elsewhere, leaving every cap at its default.
+    if not getattr(args, "config", None) and getattr(args, "workspace", None):
+        cfg_path = Path(args.workspace) / cfg_path
     if cfg_path.is_file():
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
         return Limits.from_dict(raw.get("limits"))
@@ -84,17 +90,117 @@ def _budget(args: argparse.Namespace, run_dir: Path) -> Budget:
 # -- commands ------------------------------------------------------------
 
 
+def cmd_approve(args: argparse.Namespace) -> int:
+    """Screen one action against the approval boundary.
+
+    The orchestrator's prose has said "ask before anything destructive" for
+    several rounds without it ever being checked, which is why this exists as a
+    command with an exit code the orchestrator can actually branch on. A
+    `--once` approval is deliberately not persisted: a one-off go-ahead should
+    not silently become standing permission for later runs.
+    """
+    decision = manager.needs_approval(args.action)
+    payload = decision.to_dict()
+    payload["action"] = args.action
+    payload["persisted"] = False
+    if decision.approved:
+        return _emit(payload, args.json,
+                     f"allowed: {decision.reason}")
+    return _emit(payload, args.json,
+                 f"REFUSED [{decision.code}]: {decision.reason}", code=1)
+
+
 def cmd_run_init(args: argparse.Namespace) -> int:
+    """Turn one plain-English request into a real, resumable run.
+
+    Until this existed, "the manager" was a paragraph in `agents/swarm.md`: a
+    request never became a run on disk, so nothing could inspect it, resume it,
+    or prove it happened. Intaking the request here is what lets every later
+    mechanism - phases, gate, budgets, reconciliation - attach to something
+    real.
+
+    `--objective` may be repeated; each becomes one planned task.
+    """
     workspace = Path(args.workspace).resolve()
+    request = " ".join([args.request] if isinstance(args.request, str)
+                       else list(args.request or [])).strip()
     # `--goal` is the form agents/swarm.md documents; `--title` is kept as an alias.
-    slug = store.slugify(args.slug or args.goal or args.title or "")
+    slug = store.slugify(args.slug or args.goal or args.title or request)
     slug = dated_slug(slug)
+
+    # The REQUEST is not an action. "Add a deploy button" is ordinary work that
+    # merely mentions deploying; gating on request text would train the user to
+    # blanket-approve, which is how a real destructive step gets waved through.
+    # Per-step screening happens when the manager decides to act - see
+    # `swarm approve`.
+
     run_dir = store.init_run(workspace, slug)
-    return _emit(
-        {"slug": slug, "run_dir": str(run_dir)},
-        args.json,
-        f"initialised run {slug} at {run_dir}",
+
+    lane = manager.triage(request) if request else manager.TRIAGE_FULL
+    nodes = manager.plan_tasks(args.objective or [request or slug],
+                               retry_limit=args.retries)
+
+    if args.auto_plan and nodes:
+        manager.write_plan(run_dir, nodes, goal=request or slug)
+        # Declared criteria are what the delivery gate later refuses to open
+        # without. A run that never declares any can never be gated.
+        if not gate.load_criteria(run_dir):
+            for node in nodes:
+                if node.criteria:
+                    gate.add_criterion(
+                        run_dir, gate.Criterion(f"{node.id}-done", node.criteria[0], node.id))
+
+    frontier = [n.id for n in manager.parallel_frontier(nodes)]
+    store.append_line(run_dir / store.HISTORY_FILE,
+                      f"{store.now_hhmm()} INTAKE lane={lane} tasks={len(nodes)} "
+                      f"frontier={len(frontier)} request={(request or slug)[:80]!r}\n")
+    store.atomic_write_text(
+        run_dir / store.STATUS_FILE,
+        f"# {run_dir.name}\n\nrequest: {request or slug}\n"
+        f"lane: {lane}\nphase: INTAKE\nnext: run phase UNDERSTAND\n"
+        f"tasks: {len(nodes)} (frontier {len(frontier)})\n",
     )
+    return _emit(
+        {
+            "slug": run_dir.name,
+            "run_dir": str(run_dir),
+            "lane": lane,
+            "lifecycle": list(manager.LIFECYCLE),
+            "tasks": [n.to_dict() for n in nodes],
+            "parallel_frontier": frontier,
+            "planned": bool(args.auto_plan),
+            "next": "run phase UNDERSTAND",
+        },
+        args.json,
+        f"initialised run {run_dir.name} (lane {lane}, {len(nodes)} task(s), "
+        f"frontier {len(frontier)}) at {run_dir}\nnext: run phase UNDERSTAND",
+    )
+
+
+def cmd_run_state(args: argparse.Namespace) -> int:
+    """Report what a resumed manager still owes: liveness, leases, evidence."""
+    workspace = Path(args.workspace).resolve()
+    run_dir = store.find_run(workspace, args.slug)
+    state = manager.lifecycle_state(run_dir)
+    lines = [f"phase: {state['phase']}", f"live workers: {', '.join(state['live_workers']) or 'none'}"]
+    if state["obligations"]:
+        lines.append("outstanding:")
+        lines.extend(f"  - {o}" for o in state["obligations"])
+    else:
+        lines.append("outstanding: nothing")
+    return _emit(state, args.json, "\n".join(lines))
+
+
+def cmd_run_triage(args: argparse.Namespace) -> int:
+    request = " ".join(args.request).strip()
+    lane = manager.triage(request)
+    human = {
+        manager.TRIAGE_ANSWER: "R1 answer directly - no fan-out",
+        manager.TRIAGE_RESEARCH: "R2 research fan-out - swarm/researcher only",
+        manager.TRIAGE_SINGLE: "R3 single-file job - skip ceremony",
+        manager.TRIAGE_FULL: "R4 full pipeline - plan, spawn, QC, deliver",
+    }[lane]
+    return _emit({"lane": lane}, args.json, human)
 
 
 def cmd_run_list(args: argparse.Namespace) -> int:
@@ -723,6 +829,13 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run lifecycle").add_subparsers(dest="cmd", required=True)
     i = run.add_parser("init"); i.add_argument("--slug"); i.add_argument("--title")
     i.add_argument("--goal", help="artifact-first goal sentence (the documented form)")
+    i.add_argument("--request", nargs="+",
+                   help="the user's plain-English task; this is what triage reads")
+    i.add_argument("--objective", action="append",
+                   help="one planned task; repeat for each")
+    i.add_argument("--retries", type=int, default=2)
+    i.add_argument("--auto-plan", action="store_true",
+                   help="write plan.json + workstreams.md + criteria at intake")
     i.set_defaults(func=cmd_run_init)
     l = run.add_parser("list"); l.set_defaults(func=cmd_run_list)
     s = run.add_parser("show"); s.add_argument("--slug"); s.set_defaults(func=cmd_run_show)
@@ -735,6 +848,10 @@ def build_parser() -> argparse.ArgumentParser:
     rc = run.add_parser("recover"); rc.add_argument("--slug"); rc.add_argument("--note")
     rc.set_defaults(func=cmd_run_recover)
     pt = run.add_parser("phases"); pt.set_defaults(func=cmd_run_phases)
+    st = run.add_parser("state", help="what a resumed manager must still do")
+    st.add_argument("--slug"); st.set_defaults(func=cmd_run_state)
+    tr = run.add_parser("triage", help="which lane a request belongs in")
+    tr.add_argument("request", nargs="+"); tr.set_defaults(func=cmd_run_triage)
 
     crit = sub.add_parser("criterion").add_subparsers(dest="cmd", required=True)
     ca = crit.add_parser("add"); ca.add_argument("--id", required=True); ca.add_argument("--text", required=True)
@@ -830,6 +947,12 @@ def build_parser() -> argparse.ArgumentParser:
     lau.set_defaults(func=cmd_lesson_audit)
 
     li = sub.add_parser("lint"); li.add_argument("--root", default="."); li.set_defaults(func=cmd_lint)
+
+    ap = sub.add_parser("approve", help="screen one action against the approval boundary")
+    ap.add_argument("action", help="the action the manager wants to take")
+    ap.add_argument("--once", action="store_true",
+                    help="explicitly a one-off; nothing is persisted either way")
+    ap.set_defaults(func=cmd_approve)
     st = sub.add_parser("selftest"); st.set_defaults(func=cmd_selftest)
     return p
 

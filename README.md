@@ -16,7 +16,7 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
 | **2 commands** | `/swarm <task>` and `/swarm-status` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 294 tests, no network, no API spend |
+| **`tests/`** | 336 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -86,6 +86,49 @@ python -m swarmkit selftest      # verifies the gate holds
 Just talk to it:
 
 > build me a WebAR diwali greeting with camera fireworks
+
+### Start a run from one sentence
+
+`run init --request` takes the plain-English text, decides the lane, builds the task graph,
+and writes the acceptance criteria. You never pick agents, run phases, or invoke QC yourself.
+
+```sh
+python -m swarmkit run init --request "build me a WebAR diwali greeting" --auto-plan
+#  -> {"lane":"R4","planned":true,"tasks":[...],"parallel_frontier":[...],
+#      "next":"run phase UNDERSTAND"}
+```
+
+Add `--objective` to state a subtask yourself instead of letting the plan infer it.
+
+```sh
+python -m swarmkit run triage "what is the capital of France"   # -> R1, answer directly
+python -m swarmkit run state                                      # where am I, what is outstanding
+```
+
+### The manager lifecycle
+
+Nine stages, each one an enforced phase change rather than a paragraph:
+
+```
+UNDERSTAND -> PLAN -> DELEGATE -> EXECUTE -> MONITOR -> INTEGRATE -> VERIFY -> REPAIR -> DELIVER
+```
+
+`run init` lands you at INTAKE. `run phase <PHASE>` is what actually moves you, and an illegal
+jump is refused. `UNDERSTAND` and `MONITOR` exist so the outcome and the supervision are
+recorded decisions; `MESH -> MONITOR -> MESH` allows re-spawning after a reclaim.
+
+### Approval boundary
+
+Routine decisions are the manager's own. Consequential ones are screened first:
+
+```sh
+python -m swarmkit approve "run the test suite"          # {"approved": true}
+python -m swarmkit approve "deploy to production"        # {"approved": false, "code":"APPROVAL_REQUIRED"}
+python -m swarmkit approve "add a deploy button to the ui"  # {"approved": true}
+```
+
+A refusal stops that one step and is reported; everything else carries on. Approvals are never
+persisted, so a one-off go-ahead cannot become standing permission.
 
 ### Triage
 
@@ -247,7 +290,7 @@ rather than becoming an archive.
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 294 tests
+python -m unittest discover -s tests -t .     # 336 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
 python -m swarmkit selftest                   # quick end-to-end gate check
 ```

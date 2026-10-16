@@ -32,6 +32,9 @@ HISTORY_FILE = "history.md"
 REPORTS_FILE = "reports.md"
 WORKSTREAMS_FILE = "workstreams.md"
 PLAN_FILE = "plan.md"
+#: The task graph the manager walks. Separate from ``plan.md`` on purpose:
+#: ``plan.md`` is the human narrative, this is what code reads.
+PLAN_TASKS_FILE = "plan.json"
 RETRO_FILE = "retro.md"
 CRITERIA_FILE = "criteria.json"
 EVIDENCE_FILE = "evidence.jsonl"
@@ -259,6 +262,8 @@ def init_run(workspace: Path, slug: str) -> Path:
     ):
         if not (run_dir / name).exists():
             atomic_write_text(run_dir / name, header)
+    if not (run_dir / PLAN_TASKS_FILE).exists():
+        atomic_write_json(run_dir / PLAN_TASKS_FILE, {"goal": "", "tasks": []})
     # Keep the run dir out of version control. evidence.jsonl holds raw command
     # output verbatim, and that output can contain secrets; without this the
     # run dir sits inside the workspace where `git add -A` will happily stage

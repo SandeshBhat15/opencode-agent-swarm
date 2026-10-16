@@ -10,7 +10,8 @@ from swarmkit.errors import TransitionError
 
 class TestTransitions(unittest.TestCase):
     def test_happy_path_is_legal(self) -> None:
-        path = [phases.INTAKE, phases.PLAN, phases.MESH, phases.INTEGRATE, phases.QC, phases.RETRO, phases.DELIVERED]
+        path = [phases.INTAKE, phases.UNDERSTAND, phases.PLAN, phases.MESH,
+        phases.MONITOR, phases.INTEGRATE, phases.QC, phases.RETRO, phases.DELIVERED]
         for current, nxt in zip(path, path[1:]):
             with self.subTest(current=current, nxt=nxt):
                 self.assertTrue(phases.can_transition(current, nxt))

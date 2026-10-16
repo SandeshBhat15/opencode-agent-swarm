@@ -145,7 +145,7 @@ class LifecycleFixture(TempWorkspace):
     def to_mesh(self) -> None:
         """Drive the pipeline to MESH without touching MESH itself."""
         self.plan()
-        for target in ("PLAN", "MESH"):
+        for target in ("UNDERSTAND", "PLAN", "MESH"):
             self.phase(target)
 
 
@@ -424,6 +424,7 @@ class TestNoNetworkOrModelSpend(unittest.TestCase):
             gate.add_criterion(run_dir, gate.Criterion("build", "build exits 0"))
             adapter.do_work("build", command="npm run build", result="exit 0",
                             criterion="build")
+            run_cli("run", "phase", "UNDERSTAND", "--slug", "nosock", workspace=ws)
             run_cli("run", "phase", "PLAN", "--slug", "nosock", workspace=ws)
             run_cli("run", "phase", "MESH", "--slug", "nosock", workspace=ws)
             for target in ("INTEGRATE", "QC", "RETRO", "DELIVERED"):

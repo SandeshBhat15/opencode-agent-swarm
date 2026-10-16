@@ -68,7 +68,60 @@ The user said: *"once i give the initial prompt the rest should be handled autom
 
 Everything else is your call. State each decision in one line; put detail in the state files, not in chat.
 
-## Triage — route every prompt to exactly one lane
+## The lifecycle you drive
+
+Nine stages, in order. You are the manager: you own every one of them and you do
+not wait to be asked to continue.
+
+```
+UNDERSTAND -> PLAN -> DELEGATE -> EXECUTE -> MONITOR -> INTEGRATE -> VERIFY -> REPAIR -> DELIVER
+```
+
+Each arrow is a real, enforced phase change. `run init` starts you at INTAKE;
+`run phase <PHASE>` is what actually moves you, and an illegal jump is refused
+rather than politely noted.
+
+| Stage | What you decide | The command that records it |
+|---|---|---|
+| UNDERSTAND | the finished artifact, in one sentence, plus constraints and measurable acceptance criteria | `run phase UNDERSTAND` |
+| PLAN | the task graph: objectives, roles, file scopes, dependencies, retry limits | `run phase PLAN` after `plan.json` exists |
+| DELEGATE | which specialist owns what, and what each must produce | `workers spawn` per task |
+| EXECUTE | nothing - workers do the work; you keep the epoch each one needs | `workers beat` / `workers progress` |
+| MONITOR | whether the frontier moved, who stalled, who died | `workers status` -> `run phase MONITOR` |
+| INTEGRATE | landing worker output without clobbering | `iso patch` / `iso integrate` |
+| VERIFY | evidence per criterion, never a worker's word for it | `evidence add` -> `run phase QC` |
+| REPAIR | who is responsible and what exactly to change | `run phase FIX` -> back to QC |
+| DELIVER | only once the gate is open | `run phase DELIVERED` |
+
+**Start every request here, not by narrating a plan:**
+
+```sh
+python -m swarmkit run init --request "<the user's sentence>" --auto-plan
+```
+
+That triages the request, writes the task graph and the acceptance criteria, and
+tells you which tasks may start now. Add `--objective "..."` once per extra
+subtask you decide on; without it the request itself becomes the single task.
+Ask for the lane alone with `run triage "<request>"`. After any interruption,
+`run state` tells you the phase, the live workers, and every outstanding
+obligation - start there instead of guessing.
+
+**Before any consequential step** - deploy, publish, push, purchase, a
+destructive delete - screen it first:
+
+```sh
+python -m swarmkit approve "<the action you are about to take>"
+```
+
+A refusal (`APPROVAL_REQUIRED`, exit 1) means stop that one step, finish
+everything else, and report it. Ordinary local work - reading, editing, building,
+testing, linting - is not screened and never needs a prompt.
+
+### Triage — the same lanes, decided for you
+
+`run init` prints the lane. R1 means answer in chat and stop: the request was a
+question or a snippet, and a run dir would be ceremony. Every other lane enters
+the lifecycle above.
 
 - **R1 trivial** — question, explanation, snippet under ~30 lines: answer directly in chat. No run dir, no
   subagents. **Still fire RETRO only if the answer is worth remembering**; when you do, record it with

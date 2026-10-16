@@ -10,7 +10,7 @@ from __future__ import annotations
 import textwrap
 import unittest
 
-from swarmkit import contracts
+from swarmkit import contracts, manager as manager_mod
 from swarmkit.contracts import validate_repo
 from tests.support import REPO_ROOT, TempWorkspace
 
@@ -230,6 +230,20 @@ class TestAgentPagesReachEveryCommandTheyNeed(unittest.TestCase):
         "reconcile": ["agents/swarm.md"],
     }
 
+    # The manager entry points. Same failure mode, so same guard: a command
+    # that exists but that no page tells the orchestrator to run is unreachable
+    # no matter how well it works.
+    MANAGER_ENTRY = {
+        # Matched on the flag alone, not the whole invocation: a page is free
+        # to wrap the command across lines for readability, and a guard that
+        # demands an exact string match would just push authors into ugly
+        # one-liners. What matters is that the flag is present.
+        "--request": ["agents/swarm.md", "commands/swarm.md"],
+        "run state": ["agents/swarm.md", "commands/swarm.md"],
+        "run triage": ["agents/swarm.md"],
+        "approve": ["agents/swarm.md", "commands/swarm.md"],
+    }
+
     # Every spawned worker needs to know how to keep its lease alive.
     WORKERS_NEEDING_LIVENESS = [
         "agents/swarm/builder.md",
@@ -273,6 +287,18 @@ class TestAgentPagesReachEveryCommandTheyNeed(unittest.TestCase):
                         f"{rel} never mentions `{needle}`; a worker that is not "
                         "told to beat goes stale and its slot is reclaimed",
                     )
+
+    def test_the_manager_entry_points_are_documented_where_an_agent_reads(self) -> None:
+        for command, pages in self.MANAGER_ENTRY.items():
+            for page in pages:
+                with self.subTest(command=command, page=page):
+                    self.assertIn(command, self._body(page))
+
+    def test_the_lifecycle_names_all_nine_stages_on_the_orchestrator_page(self) -> None:
+        body = self._body("agents/swarm.md")
+        for stage in manager_mod.LIFECYCLE:
+            with self.subTest(stage=stage):
+                self.assertIn(stage, body)
 
     def test_the_liveness_contract_reaches_the_delegation_template(self) -> None:
         """The spawn-time contract is where a worker first learns its epoch."""
