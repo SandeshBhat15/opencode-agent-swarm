@@ -16,7 +16,7 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
 | **2 commands** | `/swarm <task>` and `/swarm-status` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 336 tests, no network, no API spend |
+| **`tests/`** | 408 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -287,10 +287,97 @@ rather than becoming an archive.
 
 ---
 
+## The improvement engine
+
+The lessons ledger above is a cheat-sheet. This is the machinery underneath it: structured records of
+every run, tiered memory, a measurement-driven analyzer, and bounded experiments against a fixed
+baseline.
+
+### It captures on its own
+
+The moment a run reaches `DELIVERED` or `ABORTED`, `run phase` writes a structured experience into
+`.opencode/swarm-memory/experiences.jsonl`, read from the files the run actually produced — the state,
+the plan, the criteria, the evidence, the budget counters, the worker records. Nobody has to remember
+to teach it, and capture cannot claim something the run did not record. Credentials, tokens, bearer
+headers, private keys and email addresses are redacted before anything is written.
+
+```sh
+python -m swarmkit experience list --category web
+python -m swarmkit learn recall --category web     # most confident first, with provenance
+python -m swarmkit learn schema                    # the record shape
+python -m swarmkit experience challenge --run <run> --reason "<what the new evidence shows>"
+```
+
+| Tier | Means |
+| --- | --- |
+| `lesson` | A rule, extracted from a run that verified and carries a recorded command |
+| `verified` | Proved out, but nobody has distilled a rule from it yet |
+| `hypothesis` | Plausible, with no reproduced evidence |
+| `history` | A raw structured record |
+
+`lesson` is reserved for records that actually carry a rule. A verified run with no distilled rule says
+`verified`, because `learn lessons` would otherwise report rules that do not exist — found by running
+the engine end to end, not by reading it.
+
+### It refuses to overclaim
+
+`analyze` proposes a change only where a metric is both **measured** and **bad**, and it withholds any
+conclusion from fewer than five runs. Agent counts, code volume and test counts are never scored — a
+bigger engine is not a better one.
+
+```sh
+python -m swarmkit analyze --check-only   # is now a sensible moment? always says why
+python -m swarmkit analyze                # metrics plus evidenced proposals, ranked
+```
+
+### Experiments are bounded, versioned and reversible
+
+```sh
+python -m swarmkit evolve candidate --proposal <id>        # id must come from `analyze`
+python -m swarmkit evolve evaluate --proposal <id> --version <ver> \
+        --candidate final_delivery=0.90 --baseline final_delivery=0.50 --safety-passed
+python -m swarmkit evolve monitor  --version <ver> --observed final_delivery=0.20
+python -m swarmkit evolve rollback --version <ver> --reason "..."
+python -m swarmkit evolve history
+python -m swarmkit evolve scope-check --path <file>...
+```
+
+- **Candidates cannot be hand-written.** `evolve candidate` reads the analyzer's output and refuses any
+  id it did not raise (`PROPOSAL_NOT_FOUND`). An operator who can invent a proposal can invent its
+  evidence, and the loop becomes a machine for believing whatever it is told.
+- **Three gates, in order.** Safety first, so a change that improves throughput while failing a safety
+  check is rejected as unsafe rather than promoted with a caveat. Then the benchmark, which demands a
+  real margin on a guarded metric with no regression on any other. Then authorization.
+- **`verification` and `recovery` never auto-promote.** That refusal is structural, not a default: a
+  learner that can weaken the components judging it has no ground truth left to improve against.
+- **Some refusals are permanent, some are not.** A change that measurably does not help is retired so
+  nobody retries it blindly. A refusal caused by the environment — safety did not pass, authorization
+  missing — leaves the version a `candidate` and can be re-evaluated once the cause is fixed.
+- **Monitoring compares against what was promised**, not against the baseline. A change promoted at
+  0.90 that collapses to 0.60 is caught even though 0.60 still beats the 0.50 baseline it replaced.
+  Comparing to the baseline made the gate structurally unable to fire for the change it exists to police.
+- **Two independent budgets.** `max_generations` caps promoted depth; `max_candidates` caps how many
+  records may exist at all, so an engine proposing reworded versions of an idea that already lost three
+  times cannot write files forever while the first limit stays satisfied.
+- **Protected paths cannot be self-evolved**: the gate, budget, store, lessons ledger, security tests,
+  changelog and `.git` (`PROTECTED_SCOPE_CHANGE`). Every experiment runs in an isolated workspace
+  against a copied baseline.
+
+```sh
+python -m swarmkit evolve policy
+python -m swarmkit evolve policy --max-generations 3 --max-candidates 10 --no-auto-promote
+```
+
+**What is deliberately absent:** the engine does not score how many agents, files or tests exist, does
+not promote its own code, and never edits an agent page. A proposal for a page change reaches you as a
+diff.
+
+---
+
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 336 tests
+python -m unittest discover -s tests -t .     # 408 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
 python -m swarmkit selftest                   # quick end-to-end gate check
 ```
@@ -512,15 +599,26 @@ Honest list, not marketing:
 - **`lint` checks frontmatter only.** It validates agent pages' YAML (V2 permission actions, model
   pins, deny-before-allow ordering, command bindings). It never parses a page body, so it cannot
   verify that a documented CLI invocation actually works - `tests/test_cli.py` does that instead by
-  executing the documented strings verbatim.
+  executing the documented strings verbatim, and `TestAgentPagesReachEveryCommandTheyNeed` asserts the
+  page an agent reads actually contains each command it needs.
+- **The improvement engine has never run against a real corpus.** It is exercised end to end by
+  `_e2e_engine.py` and 71 unit tests, but on generated runs and seeded baselines. Nobody has watched
+  five real deliveries accumulate and checked whether its proposals are any good. This is the largest
+  unverified claim in the repo.
+- **Experience capture never invents a rule.** A delivered run with no distilled rule lands in the
+  `verified` tier, so the engine starts out with evidence but no lessons. Something has to do the
+  distillation - today that is `swarm/improve` writing to the flat ledger, and the two stores are not
+  yet joined automatically.
+- **Promotion is gated but not automatic.** `auto_promote` defaults to `False` and there is no code
+  path that flips it on. There is no scheduler: nobody calls `analyze` or `evolve candidate` on a
+  timer, so the engine improves when an agent runs the commands, not on a schedule.
 - **Worktree isolation requires git and a git repo.** Without one, only scope validation applies.
 - **`--json` is a global flag** and must precede the subcommand: `swarm --json run list`.
 
 ## Roadmap
 
 - `swarmkit budget tokens --from-opencode` — read usage from a session export instead of by hand
-- Persist a machine-readable run summary (`summary.json`) so `/swarm-status` needs no prose parsing
-- Let `swarm/improve` emit a patch file for a page, ready to review, instead of a described change
+- Join the experience store and the flat ledger, so a distilled rule carries its originating run
 - Promote the Python 3.12 CI probe to a gate once it is genuinely green
 
 ---

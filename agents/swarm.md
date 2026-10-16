@@ -117,7 +117,98 @@ A refusal (`APPROVAL_REQUIRED`, exit 1) means stop that one step, finish
 everything else, and report it. Ordinary local work - reading, editing, building,
 testing, linting - is not screened and never needs a prompt.
 
-### Triage — the same lanes, decided for you
+#### Learn from every run — it happens on its own
+
+The moment a run reaches `DELIVERED` or `ABORTED`, the engine captures a structured experience from the files the run actually wrote: what was attempted, what passed, what failed, what it cost, which workers died. **You do not have to remember to teach it.** The `run phase` command reports what was captured.
+
+That capture is what everything below is built on. Look at it before planning the next similar task:
+
+```bash
+python -m swarmkit experience record --slug <slug>      # capture manually if a run was interrupted
+python -m swarmkit experience list --category web
+python -m swarmkit learn recall --category web           # what we learned, most confident first
+python -m swarmkit learn schema                         # the record shape, for anything reading it
+```
+
+**A record is only a lesson if it carries a rule.** The tiers say so plainly: `lesson` means someone distilled a rule from a verified run; `verified` means the run proved something out but nobody has written the rule down yet. Do not dress the second up as the first.
+
+**If the record turns out to be wrong, say so rather than leaving it.** A lesson that quietly survives contradicting evidence is how a correct rule gets buried:
+
+```bash
+python -m swarmkit experience challenge --run <run> --reason "what the new evidence shows"
+```
+
+### Propose a change only when something measurable is weak
+
+Analysis is not a brainstorming session. It refuses to propose anything that is not both measured and bad, and it refuses to conclude anything from fewer than five runs:
+
+```bash
+python -m swarmkit analyze --check-only    # is now a sensible moment? says why either way
+python -m swarmkit analyze                 # metrics plus evidenced proposals, ranked
+```
+
+Then, and only from what the analyzer produced:
+
+```bash
+python -m swarmkit evolve candidate --proposal <id>       # look the id up in the analyze output
+```
+
+**You cannot hand-write a proposal.** The candidate command reads the analyzer's output and refuses any id it did not raise (`PROPOSAL_NOT_FOUND`). An operator who can invent a proposal can invent its evidence, and the loop becomes a machine for believing whatever it is told.
+
+### Prove the change before it becomes the default
+
+Every experiment is judged against a **fixed baseline**, never against nothing:
+
+```bash
+python -m swarmkit evolve evaluate --proposal <id> --version <ver> \
+    --candidate final_delivery=0.90 --baseline final_delivery=0.50 --safety-passed
+```
+
+Three gates, in this order, and the order is the point:
+
+1. **Safety first.** A candidate that improves throughput while failing a safety check is rejected as unsafe, not promoted with a caveat.
+2. **Then the benchmark.** It must beat the baseline on a guarded metric by a real margin, and it must not regress any other one. Faster at failing is not better.
+3. **Then authorization.** `verification` and `recovery` targets never auto-promote whatever the policy says. That refusal is structural: a learner that can weaken the components judging it has no ground truth left to improve against.
+
+A refusal that is about the *idea* (no measurable gain, or a regression) is permanent — the proposal is retired so nobody retries it blindly. A refusal that is about the *environment* (safety did not pass, authorization missing) is **not**: fix the cause and run `evaluate` again.
+
+**A promotion is a bet, so call it.** After the change is live, compare what happens against what it promised:
+
+```bash
+python -m swarmkit evolve monitor --version <ver> --observed final_delivery=0.20
+```
+
+It compares against the promoted metrics, not the baseline, so a change that collapses below its own promise is caught even while still beating what it replaced. If it breaches, the change is withdrawn rather than defended:
+
+```bash
+python -m swarmkit evolve rollback --version <ver> --reason "what went wrong"
+python -m swarmkit evolve history        # audit trail, active pointer, budget counters
+```
+
+### What the engine may never touch
+
+Self-evolution is the one place where a mistake is self-perpetuating, so the scope is fenced:
+
+```bash
+python -m swarmkit evolve scope-check --path <file>...    # refuses PROTECTED_SCOPE_CHANGE
+```
+
+Protected: the gate, the budget, the store, the lessons ledger, the security tests, the changelog, and `.git`. Every experiment runs in an isolated workspace against a copied baseline. **If a change would edit one of those, it is not a change the engine gets to make.**
+
+### Stay inside the budget
+
+The engine is a tool, not a competitor for your attention. `analyze --check-only` says so when there is nothing worth analysing, and the operator caps everything:
+
+```bash
+python -m swarmkit evolve policy
+python -m swarmkit evolve policy --max-generations 3 --max-candidates 10 --no-auto-promote
+```
+
+Two independent limits, because they bound different failures: `max_generations` caps how deep the promoted chain may go, and `max_candidates` caps how many records may exist at all. Without the second, an engine proposing slightly reworded versions of an idea that already lost three times would write files forever while the first limit stayed satisfied.
+
+**Never edit an agent page to record what the engine learned.** Propose it; a human applies it.
+
+## Triage — the same lanes, decided for you
 
 `run init` prints the lane. R1 means answer in chat and stop: the request was a
 question or a snippet, and a run dir would be ceremony. Every other lane enters

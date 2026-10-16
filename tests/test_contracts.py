@@ -244,6 +244,21 @@ class TestAgentPagesReachEveryCommandTheyNeed(unittest.TestCase):
         "approve": ["agents/swarm.md", "commands/swarm.md"],
     }
 
+    # The improvement engine. Same reasoning as MANAGER_ENTRY: a mechanism no
+    # agent is told to invoke is a mechanism that does not run, which is the
+    # defect two audit rounds already found once each.
+    IMPROVEMENT_ENGINE = {
+        "experience record": ["agents/swarm.md"],
+        "experience challenge": ["agents/swarm.md", "agents/swarm/improve.md"],
+        "learn recall": ["agents/swarm.md", "agents/swarm/improve.md"],
+        "analyze": ["agents/swarm.md", "agents/swarm/improve.md"],
+        "evolve candidate": ["agents/swarm.md"],
+        "evolve evaluate": ["agents/swarm.md"],
+        "evolve monitor": ["agents/swarm.md"],
+        "evolve rollback": ["agents/swarm.md"],
+        "evolve scope-check": ["agents/swarm.md"],
+    }
+
     # Every spawned worker needs to know how to keep its lease alive.
     WORKERS_NEEDING_LIVENESS = [
         "agents/swarm/builder.md",
@@ -290,6 +305,12 @@ class TestAgentPagesReachEveryCommandTheyNeed(unittest.TestCase):
 
     def test_the_manager_entry_points_are_documented_where_an_agent_reads(self) -> None:
         for command, pages in self.MANAGER_ENTRY.items():
+            for page in pages:
+                with self.subTest(command=command, page=page):
+                    self.assertIn(command, self._body(page))
+
+    def test_the_improvement_engine_is_documented_where_an_agent_reads(self) -> None:
+        for command, pages in self.IMPROVEMENT_ENGINE.items():
             for page in pages:
                 with self.subTest(command=command, page=page):
                     self.assertIn(command, self._body(page))

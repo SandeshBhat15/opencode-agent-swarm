@@ -15,7 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import contracts, gate, isolator, lessons, manager, phases, store, workers
+from . import (analysis, contracts, evolve, experience, gate, isolator,
+               lessons, manager, phases, store, workers)
 from .budget import Budget, Limits
 from .errors import SwarmError
 
@@ -316,8 +317,17 @@ def cmd_run_phase(args: argparse.Namespace) -> int:
             + (f" ({args.reason})" if args.reason else ""),
         )
         _rewrite_status(run_dir, state)
-    return _emit({"phase": state.phase, "from": current, "fix_cycles": state.fix_cycles}, args.json,
-                 f"phase {current} -> {state.phase}")
+    captured: dict[str, Any] = {}
+    if state.phase in (phases.DELIVERED, phases.ABORTED):
+        captured = _capture_terminal(run_dir, workspace, state, args)
+    human = f"phase {current} -> {state.phase}"
+    if captured:
+        human += f"  (experience {captured.get('tier', 'recorded')}"
+        if not captured.get("ok"):
+            human += " - CAPTURE FAILED, reported not raised"
+        human += ")"
+    return _emit({"phase": state.phase, "from": current, "fix_cycles": state.fix_cycles,
+                  "experience": captured}, args.json, human)
 
 
 def _rewrite_status(run_dir: Path, state: store.RunState) -> None:
@@ -844,6 +854,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="target phase, e.g. `run phase DELIVERED`")
     ph.add_argument("--to", choices=_PHASE_CHOICES, help="alias for the positional form")
     ph.add_argument("--slug"); ph.add_argument("--reason")
+    ph.add_argument("--request", nargs="+",
+                    help="the original request, captured into memory on delivery")
+    ph.add_argument("--corrected", action="append",
+                    help="a correction the user made; repeatable. Recorded as a "
+                         "lesson candidate only if it contradicts a real past run.")
+    phacc = ph.add_mutually_exclusive_group()
+    phacc.add_argument("--accepted", dest="user_accepted", action="store_true",
+                       help="the user accepted this delivery")
+    phacc.add_argument("--rejected", dest="user_accepted", action="store_false",
+                       help="the user rejected this delivery")
     ph.set_defaults(func=cmd_run_phase)
     rc = run.add_parser("recover"); rc.add_argument("--slug"); rc.add_argument("--note")
     rc.set_defaults(func=cmd_run_recover)
@@ -953,8 +973,358 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--once", action="store_true",
                     help="explicitly a one-off; nothing is persisted either way")
     ap.set_defaults(func=cmd_approve)
+
+    # -- the improvement loop, reachable from the agent pages ------------
+    xp = sub.add_parser("experience", help="structured record of finished runs")
+    xps = xp.add_subparsers(dest="cmd", required=True)
+    xr = xps.add_parser("record", help="capture a finished run into memory")
+    xr.add_argument("--slug"); xr.add_argument("--request", nargs="+")
+    xr.add_argument("--corrected", action="append",
+                    help="a correction the user made; repeatable")
+    acc = xr.add_mutually_exclusive_group()
+    acc.add_argument("--accepted", dest="user_accepted", action="store_true")
+    acc.add_argument("--rejected", dest="user_accepted", action="store_false")
+    xr.set_defaults(func=cmd_experience_record)
+    xl = xps.add_parser("list", help="list recorded experiences")
+    xl.add_argument("--category"); xl.add_argument("--outcome"); xl.add_argument("--cause")
+    xl.add_argument("--limit", type=int, default=20); xl.set_defaults(func=cmd_experience_list)
+    xc = xps.add_parser("challenge", help="record evidence that contradicts a past conclusion")
+    xc.add_argument("--run", required=True); xc.add_argument("--reason", required=True)
+    xc.set_defaults(func=cmd_experience_challenge)
+
+    ln = sub.add_parser("learn", help="what memory holds, and its shape")
+    lns = ln.add_subparsers(dest="cmd", required=True)
+    lr = lns.add_parser("recall", help="grounded material for a category, most confident first")
+    lr.add_argument("--category"); lr.add_argument("--cause")
+    lr.add_argument("--limit", type=int, default=5); lr.set_defaults(func=cmd_learn_recall)
+    lsch = lns.add_parser("schema", help="the experience record schema")
+    lsch.set_defaults(func=cmd_learn_schema)
+
+    an = sub.add_parser("analyze", help="measure past runs and raise evidenced proposals")
+    an.add_argument("--category"); an.add_argument("--check-only", action="store_true",
+                                                    help="only answer whether now is a good time")
+    an.set_defaults(func=cmd_analyze)
+
+    ve = sub.add_parser("evolve", help="bounded experiments against a fixed baseline")
+    ves = ve.add_subparsers(dest="cmd", required=True)
+    vc = ves.add_parser("candidate", help="register an analyzer proposal as a candidate")
+    vc.add_argument("--proposal", required=True)
+    vc.add_argument("--category"); vc.add_argument("--kind", default="policy")
+    vc.add_argument("--max-generations", type=int); vc.add_argument("--max-candidates", type=int)
+    vc.set_defaults(func=cmd_evolve_candidate)
+    vv = ves.add_parser("evaluate", help="safety gate, then benchmark, then authorization")
+    vv.add_argument("--proposal", required=True); vv.add_argument("--version", required=True)
+    vv.add_argument("--candidate", action="append", nargs="+", help="metric=value; repeatable, or several after one flag")
+    vv.add_argument("--baseline", action="append", nargs="+", help="metric=value; repeatable, or several after one flag")
+    vv.add_argument("--safety-passed", action="store_true")
+    vv.add_argument("--authorized", action="store_true")
+    vv.add_argument("--min-gain", type=float); vv.set_defaults(func=cmd_evolve_evaluate)
+    vb = ves.add_parser("rollback", help="withdraw a promoted version")
+    vb.add_argument("--version", required=True); vb.add_argument("--reason", default="")
+    vb.set_defaults(func=cmd_evolve_rollback)
+    vm = ves.add_parser("monitor", help="call the bet: compare post-promotion metrics")
+    vm.add_argument("--version", required=True)
+    vm.add_argument("--observed", action="append", nargs="+", help="metric=value; repeatable, or several after one flag")
+    vm.set_defaults(func=cmd_evolve_monitor)
+    vp = ves.add_parser("policy", help="show or set the limits on the improvement loop")
+    vp.add_argument("--min-new-experiences", type=int); vp.add_argument("--cooldown-s", type=float)
+    vp.add_argument("--max-candidates", type=int); vp.add_argument("--max-generations", type=int)
+    vp.add_argument("--min-gain", type=float)
+    vp.add_argument("--auto-promote", dest="auto_promote", action="store_true", default=None)
+    vp.add_argument("--no-auto-promote", dest="auto_promote", action="store_false")
+    vp.add_argument("--auto-promote-target", action="append")
+    vp.set_defaults(func=cmd_evolve_policy)
+    vh = ves.add_parser("history", help="audit trail, active pointer, budget counters")
+    vh.add_argument("--limit", type=int, default=20); vh.set_defaults(func=cmd_evolve_history)
+    vsc = ves.add_parser("scope-check", help="refuse a self-evolution edit of a protected path")
+    vsc.add_argument("--path", action="append"); vsc.set_defaults(func=cmd_evolve_scope_check)
+
     st = sub.add_parser("selftest"); st.set_defaults(func=cmd_selftest)
     return p
+
+
+# --- self-evolution: experience, memory, analysis, bounded experiments ------
+#
+# Everything below is the engine the spec asked for. It is wired into the
+# manager lifecycle rather than left as a library nobody calls, because two
+# audit rounds already found exactly that failure shape: a mechanism that works
+# and is unreachable.
+
+
+def _memory_root(workspace: Path) -> Path:
+    return workspace / experience.MEMORY_ROOT
+
+
+def _evolve_root(workspace: Path) -> Path:
+    return workspace / evolve.EVOLUTION_ROOT
+
+
+def _pairs(values: Any) -> dict[str, Any]:
+    """``k=v`` pairs into a dict, accepting both ``--candidate a=1 --candidate b=2``
+    and ``--candidate a=1 b=2``.
+
+    Deliberately not ``--json``: quoting a JSON object on a PowerShell command
+    line corrupts it often enough that the flag becomes a trap. ``k=v`` also
+    keeps the caller from smuggling a structure the metrics never promised.
+    """
+    flat: list[str] = []
+    if values is None:
+        return {}
+    if isinstance(values, str):
+        flat.append(values)
+    else:
+        for item in values:
+            flat.extend(item if isinstance(item, (list, tuple)) else [item])
+
+    out: dict[str, Any] = {}
+    for raw in flat:
+        if "=" not in raw:
+            raise SwarmError(
+                f"expected key=value, got {raw!r}", code="BAD_USAGE")
+        key, _, value = raw.partition("=")
+        key = key.strip()
+        if not key:
+            raise SwarmError(f"empty key in {raw!r}", code="BAD_USAGE")
+        try:
+            out[key] = float(value)
+        except ValueError:
+            out[key] = value
+    return out
+
+
+def _experience_row(record: experience.Experience) -> dict[str, Any]:
+    return {
+        "run": record.run,
+        "category": record.category,
+        "outcome": record.outcome,
+        "complexity": record.complexity,
+        "tier": record.tier,
+        "confidence": record.confidence,
+        "verified": record.verified,
+        "failure_cause": record.failure_cause,
+        "root_cause_established": record.root_cause_established,
+        "lessons": record.lessons,
+        "hypotheses": record.hypotheses,
+        "retries": record.retries,
+        "at": record.at,
+    }
+
+
+def _capture_terminal(run_dir: Path, workspace: Path,
+                      state: store.RunState, args: argparse.Namespace) -> dict[str, Any]:
+    """Capture a finished run into memory. Never raises.
+
+    Called when a run reaches a terminal phase so the engine learns without
+    anyone having to remember to teach it. It is wrapped because a run that
+    genuinely delivered must not be reported as failed because a memory write
+    failed - but the failure is reported rather than swallowed, because a
+    silently dead learner looks exactly like a learner with nothing to say.
+    """
+    try:
+        record = experience.capture_run(
+            run_dir,
+            request=getattr(args, "request", "") or "",
+            user_corrections=getattr(args, "corrected", None) or (),
+            user_accepted=getattr(args, "user_accepted", None),
+        )
+        experience.ExperienceStore(_memory_root(workspace)).record(record)
+        return {"ok": True, "run": record.run, "outcome": record.outcome,
+                "tier": record.tier, "confidence": record.confidence,
+                "verified": record.verified}
+    except Exception as exc:  # noqa: BLE001 - deliberately total
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def cmd_experience_record(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    run_dir = _run_dir(workspace, args.slug)
+    result = _capture_terminal(run_dir, workspace, store.RunState.load(run_dir), args)
+    if not result.get("ok"):
+        return _emit({"experience": result}, args.json,
+                     f"experience capture FAILED: {result.get('error')}", code=1)
+    return _emit({"experience": result}, args.json,
+                 f"recorded experience for {result['run']} "
+                 f"(tier {result['tier']}, confidence {result['confidence']})")
+
+
+def cmd_experience_list(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    found = experience.ExperienceStore(_memory_root(workspace)).search(
+        category=args.category, outcome=args.outcome,
+        failure_cause=args.cause, limit=args.limit)
+    rows = [_experience_row(item) for item in found]
+    lines = [f"{r['run']}  {r['outcome']:<11} {r['tier']:<10} conf={r['confidence']:.2f}"
+             f"  {r['failure_cause']}" for r in rows] or ["(no experiences recorded)"]
+    return _emit({"experiences": rows, "count": len(rows)}, args.json, "\n".join(lines))
+
+
+def cmd_experience_challenge(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    result = experience.Memory(_memory_root(workspace)).challenge(args.run, args.reason)
+    return _emit(result, args.json,
+                 f"challenged {args.run}: {result.get('reason', '')}")
+
+
+def cmd_learn_recall(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    memory = experience.Memory(_memory_root(workspace))
+    recalled = memory.recall(category=args.category, failure_cause=args.cause,
+                             limit=args.limit)
+    lessons = memory.lessons()
+    hypotheses = memory.hypotheses()
+    lines = [f"[{r['confidence']:.2f}] {r['rule']}  ({r['origin']})" for r in recalled]
+    lines.append(f"-- {len(lessons)} lesson(s), {len(hypotheses)} hypothesis(es) in memory")
+    return _emit({"recall": recalled, "lessons": len(lessons),
+                  "hypotheses": len(hypotheses)}, args.json, "\n".join(lines))
+
+
+def cmd_learn_schema(args: argparse.Namespace) -> int:
+    schema = analysis.describe_schema()
+    return _emit(schema, args.json, json.dumps(schema, indent=2, default=str))
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    root = _memory_root(workspace)
+    store_ = experience.ExperienceStore(root)
+    should, why = analysis.should_analyze(store_.all())
+    if args.check_only:
+        return _emit({"should_analyze": should, "reason": why}, args.json,
+                     f"{'analyze' if should else 'hold off'}: {why}")
+    result = analysis.analyze(root, category=args.category)
+    lines = [f"{k}: {v}" for k, v in result["metrics"].items() if not isinstance(v, (dict, list))]
+    lines.append(f"sample_sufficient: {result['sample_sufficient']} "
+                 f"(min {result['min_sample']})")
+    for proposal in result["proposals"]:
+        flag = "  [NEEDS AUTHORIZATION]" if proposal["needs_authorization"] else ""
+        lines.append(f"- [{proposal['target']}] {proposal['id']}: "
+                     f"{proposal['problem']}{flag}")
+    if not result["proposals"]:
+        lines.append("no proposal: nothing measured is currently bad")
+    return _emit(result, args.json, "\n".join(lines))
+
+
+def cmd_evolve_candidate(args: argparse.Namespace) -> int:
+    """Register a proposal that the analyzer actually produced.
+
+    Candidates are never hand-written. An operator who can invent a proposal
+    can invent its evidence, and then the loop is just a machine for
+    believing whatever it is told - which is the whole failure mode a
+    self-improvement engine has to avoid.
+    """
+    workspace = Path(args.workspace).resolve()
+    root = _memory_root(workspace)
+    result = analysis.analyze(root, category=args.category)
+    match = next((p for p in result["proposals"] if p["id"] == args.proposal), None)
+    if match is None:
+        known = [p["id"] for p in result["proposals"]]
+        raise SwarmError(
+            f"no analyzer proposal {args.proposal!r}; available: {known or 'none'}. "
+            "Run `swarm analyze` first - candidates come from measurements, "
+            "not from hand-written wishes.",
+            code="PROPOSAL_NOT_FOUND")
+    policy = evolve.load_policy(_evolve_root(workspace))
+    version = evolve.create_candidate(
+        analysis.Proposal(**{k: match[k] for k in (
+            "id", "target", "problem", "evidence", "change",
+            "expected_benefit", "risks", "evaluation", "rollback")}),
+        evolve.VersionStore(_evolve_root(workspace)),
+        kind=args.kind,
+        max_generations=args.max_generations or policy.max_generations,
+        max_candidates=args.max_candidates or policy.max_candidates)
+    return _emit({"version": version, "generation": version["generation"]}, args.json,
+                 f"candidate {version['id']} registered (generation "
+                 f"{version['generation']}, state {version['state']})")
+
+
+def cmd_evolve_evaluate(args: argparse.Namespace) -> int:
+    store_ = evolve.VersionStore(_evolve_root(Path(args.workspace).resolve()))
+    # `--min-gain` is optional, and an absent flag must become the documented
+    # default rather than None. Passing None straight through reaches
+    # `compare`, where `gain < min_gain` raises TypeError instead of rejecting
+    # a too-small gain - an unusable benchmark gate dressed up as one.
+    min_gain = evolve.DEFAULT_MIN_GAIN if args.min_gain is None else args.min_gain
+    result = evolve.evaluate(args.proposal, args.version,
+                             _pairs(args.candidate), _pairs(args.baseline),
+                             store_, safety_passed=args.safety_passed,
+                             authorized=args.authorized, min_gain=min_gain)
+    verdict = "PROMOTED" if result.get("promoted") else f"rejected: {result.get('reason')}"
+    return _emit(result, args.json,
+                 f"{args.version}: {verdict}"
+                 + (f" (gain {result['gain']})" if result.get("gain") is not None else ""),
+                 code=0 if result.get("promoted") else 1)
+
+
+def cmd_evolve_rollback(args: argparse.Namespace) -> int:
+    store_ = evolve.VersionStore(_evolve_root(Path(args.workspace).resolve()))
+    result = evolve.rollback(args.version, store_, reason=args.reason)
+    # `active()` returns a Version, not a dict. Getting this wrong turns a
+    # successful rollback into a traceback - the withdrawal happened on disk
+    # and then the process died while describing it.
+    active = store_.active()
+    return _emit(result, args.json,
+                 f"rolled back {args.version} -> active is now "
+                 f"{active.id if active else 'none'}")
+
+
+def cmd_evolve_monitor(args: argparse.Namespace) -> int:
+    store_ = evolve.VersionStore(_evolve_root(Path(args.workspace).resolve()))
+    result = evolve.monitor(args.version, _pairs(args.observed), store_)
+    return _emit(result, args.json,
+                 f"monitor {args.version}: {'healthy' if result.get('ok') else 'REGRESSED'}"
+                 + (f" - {result.get('detail', '')}" if result.get("detail") else ""),
+                 code=0 if result.get("ok") else 1)
+
+
+def cmd_evolve_policy(args: argparse.Namespace) -> int:
+    root = _evolve_root(Path(args.workspace).resolve())
+    policy = evolve.load_policy(root)
+    touched = any(v is not None for v in (
+        args.min_new_experiences, args.cooldown_s, args.max_candidates,
+        args.max_generations, args.min_gain, args.auto_promote))
+    if touched:
+        for name in ("min_new_experiences", "cooldown_s", "max_candidates",
+                     "max_generations", "min_gain"):
+            value = getattr(args, name)
+            if value is not None:
+                setattr(policy, name, value)
+        if args.auto_promote is not None:
+            policy.auto_promote = args.auto_promote
+        if args.auto_promote_target is not None:
+            policy.auto_promote_targets = tuple(args.auto_promote_target)
+        evolve.save_policy(policy, root)
+        return _emit(policy.to_dict(), args.json, f"policy saved: {policy.to_dict()}")
+    return _emit(policy.to_dict(), args.json,
+                 "\n".join(f"{k}: {v}" for k, v in policy.to_dict().items()))
+
+
+def cmd_evolve_history(args: argparse.Namespace) -> int:
+    store_ = evolve.VersionStore(_evolve_root(Path(args.workspace).resolve()))
+    active = store_.active()
+    payload = {
+        "active": active.to_dict() if active else None,
+        "promoted_generation": store_.generations(),
+        "candidate_records": store_.candidate_count(),
+        "rejected_rules": sorted(store_.rejected_rules()),
+        "events": store_.history()[-args.limit:],
+    }
+    lines = [f"active: {active.id if active else 'none'}",
+             f"promoted generation: {payload['promoted_generation']}",
+             f"candidate records: {payload['candidate_records']}",
+             f"rejected rules: {len(payload['rejected_rules'])}"]
+    lines += [f"  {e.get('at', '?')} {e.get('event', '?')} "
+              f"{e.get('version') or e.get('proposal') or ''}".rstrip()
+              for e in payload["events"]]
+    return _emit(payload, args.json, "\n".join(lines))
+
+
+def cmd_evolve_scope_check(args: argparse.Namespace) -> int:
+    """Refuse a self-evolution edit that touches a protected path."""
+    paths = args.path or []
+    allowed = evolve.assert_scope_allowed(paths)
+    return _emit({"allowed": allowed, "protected": sorted(evolve.PROTECTED_PATHS)},
+                 args.json,
+                 f"scope ok: {allowed}" if allowed else "scope refused")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

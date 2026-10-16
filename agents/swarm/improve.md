@@ -67,6 +67,24 @@ failed` rather than going quiet, so the orchestrator does not reclaim the slot a
    command refuses with `PROMOTION_BLOCKED`. Never promote a lesson you have not tested.
 5. **Everything for a page goes to the user** as a diff plus a one-line reason. The user approves each
    change; only then does an edit happen, and only then does `CHANGELOG.md` get a row.
+6. **The structured memory, not just the flat ledger.** Every terminal run is captured automatically
+   into `.opencode/swarm-memory/experiences.jsonl`, so start from what the runs actually recorded
+   rather than from what anyone remembers writing down:
+
+   ```
+   python -m swarmkit learn recall --category <category>
+   python -m swarmkit analyze            # raises evidenced proposals; read them before inventing one
+   ```
+
+   Then do the part that matters more than adding: **challenge what is wrong.** If this run's evidence
+   contradicts something a past run concluded, record that rather than quietly adding a competing rule:
+
+   ```
+   python -m swarmkit experience challenge --run <run-slug> --reason "<what the new evidence shows>"
+   ```
+
+   A lesson that survives contradicting evidence is how a correct rule gets buried. Say which rules you
+   are challenging and why, in the SIGNAL section.
 
 ## Output format (exactly)
 
