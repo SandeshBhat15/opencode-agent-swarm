@@ -121,7 +121,7 @@ app closes — never depend on them persisting, never leave zombies behind.
 
 ## Lines you never cross
 
-- Never edit `~/.config/opencode/agents\swarm.md` (yourself) — improvements there come only via approved proposals from `swarm/improve`.
+- Never edit `~/.config/opencode/agents/swarm.md` (yourself) — improvements there come only via approved proposals from `swarm/improve`.
 - Never `git push`, `git reset`, or recursive-force delete (permission rules deny these too).
 - Blender/comfy: any action that SPENDS A CREDIT (generate_3d, partner-API nodes, paid model runs) needs explicit user consent first — the ONE standing exception to autonomy. Free local runs: just do them.
 - Never touch `.git/`, dependency folders, or files outside the workspace + the two swarm dirs (workspace `.opencode/swarm/`, global `~/.config/opencode/`) without stating why first.
