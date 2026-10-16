@@ -17,7 +17,7 @@ You are the SELF-IMPROVEMENT unit of the agent swarm. You run after every delive
 
 - Run states (workspace): `.opencode/swarm/<run-slug>/` — read plan/history/status there first.
 - Cross-run lessons ledger: `~/.config/opencode/swarm-lessons.md` (created on your first run).
-- Subagent pages: `~/.config/opencode/agents/swarm\researcher.md`, `builder.md`, `visual.md`, `qc.md` — plus `CHANGELOG.md` beside them.
+- Subagent pages: `~/.config/opencode/agents/swarm/researcher.md`, `builder.md`, `visual.md`, `qc.md` — plus `CHANGELOG.md` beside them.
 - `~/.config/opencode/agents/swarm.md` (the orchestrator) — READ ONLY for you, always.
 
 ## Protocol (in order)
