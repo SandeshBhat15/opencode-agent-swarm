@@ -8,6 +8,7 @@ The agent pages in ``agents/`` describe *intent*; this package provides the
 * :mod:`swarmkit.gate`      - delivery gate driven by criteria + evidence
 * :mod:`swarmkit.budget`    - hard ceilings on agents, spawns, retries, time, tokens
 * :mod:`swarmkit.isolator`  - write-scope overlap detection + git worktree isolation
+* :mod:`swarmkit.workers`   - worker liveness: heartbeats, stale/timeout detection, safe reclaim
 * :mod:`swarmkit.lessons`   - grounded, deduped, never-auto-promoted lessons
 * :mod:`swarmkit.contracts` - lint that catches inert guardrails and stale model pins
 
@@ -16,7 +17,7 @@ Zero third-party dependencies. ``python -m swarmkit --help``.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .errors import (
     BudgetExceeded,

@@ -16,7 +16,7 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
 | **2 commands** | `/swarm <task>` and `/swarm-status` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 191 tests, no network, no API spend |
+| **`tests/`** | 243 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -32,7 +32,8 @@ and nothing would notice.
 | phases run in order | `run phase` refuses an illegal transition |
 | verify before delivering | `run phase DELIVERED` refuses unless every criterion has passing evidence |
 | disjoint file scopes | `scope plan --strict` fails closed on overlap |
-| bounded retries | `budget retry`, `budget spawn` cap concurrency and retries |
+| bounded retries | `workers spawn` charges a retry atomically before the attempt; cap enforced |
+| a dead worker is detected | `workers beat` / `workers status` → `stale` vs `slow`, `workers reclaim` |
 | workers do not collide | `iso create` / `iso integrate` — real git worktrees, conflict refusal |
 | nothing is lost on interrupt | atomic writes + journal + `run recover` |
 | self-improvement is safe | `lesson add --failure`, `lesson promote --tests-passed` |
@@ -246,7 +247,7 @@ rather than becoming an archive.
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 191 tests
+python -m unittest discover -s tests -t .     # 243 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
 python -m swarmkit selftest                   # quick end-to-end gate check
 ```
@@ -280,9 +281,40 @@ non-blocking job probes Python 3.12.
 | `CORRUPT_STATE` | `state.json` is unreadable or missing `slug`/`phase`. Move it aside and `run recover`, or delete the run - `run init` regenerates it |
 | `CORRUPT_BUDGET` | `budget.json` is unreadable. Refused rather than reset, because these counters are what enforce the spawn/retry caps across CLI calls |
 | `AMBIGUOUS_RUN` | A bare slug matched more than one run. Pass the full directory name, e.g. the `<date>-<slug>` form |
+| `DUPLICATE_WORKER` | That worker is `alive` or `slow` - refusing to run two of them. Check `workers status` |
+| `EPOCH_MISMATCH` | A `beat`/`finish` from a worker that was already reclaimed and respawned. Use the current epoch |
+| `NO_SUCH_WORKER` | `workers beat`/`finish` named a worker that is not in the registry for this run |
+| `BAD_STATE` | `workers finish --state` accepts only `ok` or `failed` |
+| `CORRUPT_REGISTRY` | `workers.json` is unreadable. Move it aside to reset worker state |
+| `LEASE_NOT_OWNED` | `budget release` given an epoch that does not own the lease |
+| `LOCK_HELD` | A concurrent `counters.lock` did not free within `LOCK_WAIT_SECONDS` (5s). Retry |
 | `NO_SUCH_WORKTREE` | `iso --ws` name is unknown. The message lists the workstreams the manifest actually holds |
 | `BAD_USAGE` on `run phase` | Neither a positional phase nor `--to` was given, or the two disagreed |
-| Worker appears hung | **There is no liveness detection** - swarmkit cannot tell you a worker died. A lease frees itself after 15 min, but nothing reports it as stale. Check the worker's own output |
+| Worker appears hung | `workers status` classifies each worker `alive`/`slow`/`stale`/`timeout`. A `slow` worker is beating and is fine; a `stale` one stopped beating. `workers reclaim --name X` frees a dead worker's slot, then re-spawn it |
+
+### Worker liveness and retries
+
+```sh
+python -m swarmkit workers spawn  --name build --role builder --timeout 900
+#  -> {"worker": {"name":"build","attempt":1,"epoch":"9f2c..."}, "retry_delay": 2.0, ...}
+
+python -m swarmkit workers beat   --name build --epoch 9f2c...   # every ~30s
+python -m swarmkit workers status                              # alive/slow/stale/timeout per worker
+python -m swarmkit workers finish --name build --epoch 9f2c... --state ok
+python -m swarmkit workers reclaim                            # frees only stale/timeout slots
+```
+
+- **`--epoch` is an ownership token.** A worker reclaimed and respawned gets a *new* epoch; the old
+  one's `beat`/`finish` is refused with `EPOCH_MISMATCH`. A zombie cannot resurrect itself and a
+  live worker cannot be finished by a stale predecessor.
+- **Dead vs slow.** `alive` = beating recently. `slow` = beating, but past 80% of its timeout - still
+  healthy, never reclaimed. `stale` = no beat for `stale_seconds` (default 120) - probably dead.
+  `timeout` = outlived `timeout_s` regardless of beating, so an infinite loop cannot beat its way out.
+- **Retries are automatic.** Re-spawning a worker whose predecessor is gone charges a retry *before*
+  the attempt starts, so `max_retries_per_worker` stops it even if nobody calls `budget retry`.
+- **Counters are atomic.** `budget.json` updates happen under `counters.lock`, so N concurrent
+  `workers spawn` calls cannot lose an increment and slip past a cap. Covered by a test that races
+  12 threads and asserts exactly 4 are granted at `max_concurrent_agents=4`.
 
 ### Recovering an interrupted run
 
@@ -294,6 +326,53 @@ python -m swarmkit run phase <NEXT>
 ```
 
 State writes are atomic (temp file → fsync → rename), so you never resume from a half-written file.
+
+### Live-model smoke test (manual approval required)
+
+`swarmkit` never calls a model, so nothing here has ever been exercised against a real one. This is
+the procedure for doing that. **It spends real tokens. Ask before running it, and run it in a
+throwaway directory - never against a project you cannot lose.**
+
+```sh
+# 0. Throwaway git repo, nothing of value in it.
+mkdir smoke && cd smoke && git init -b main && git commit --allow-empty -m init
+
+# 1. Caps set low on purpose, so a runaway run stops itself early.
+cat > swarm.config.json <<'JSON'
+{ "limits": { "max_concurrent_agents": 2, "max_spawns_total": 6,
+              "max_retries_per_worker": 1, "max_fix_cycles": 1,
+              "max_wall_clock_seconds": 600 } }
+JSON
+
+# 2. A task with an objective, checkable acceptance criterion.
+python -m swarmkit run init --slug smoke --goal "a greeter script that prints Hello and exits 0"
+
+# 3. Run the swarm against it, from the OpenCode session, with `swarm` as the agent.
+#    Ask for something trivial. The point is to watch the machinery, not the output.
+
+# 4. While it runs, from a second shell - this is what you are actually testing:
+python -m swarmkit --json workers status
+python -m swarmkit --json budget show
+python -m swarmkit --json run show
+
+# 5. After: confirm it refused to cheat.
+python -m swarmkit --json gate check
+```
+
+**Pass criteria** - all must hold, or the smoke test found a real bug:
+
+| Check | Expected |
+|---|---|
+| `run show` walks `PLAN → MESH → INTEGRATE → QC → RETRO → DELIVERED` in order | no phase skipped |
+| Delivery is refused before evidence exists | `error [GATE_CLOSED]` |
+| `workers status` showed every spawned worker | each reaches a terminal state |
+| A worker that failed was reclaimed, not silently retried forever | `retries` ≤ cap, then `RETRY_LIMIT` |
+| `budget.json` spawn count equals the workers actually spawned | counters not reset mid-run |
+| The orchestrator obeyed its own instructions | no agent page edited, no git push |
+
+**If any row fails**, that is a finding, not a flake. Re-run `tests/test_integration.py` with the
+observed behaviour encoded as a mock first - that test is free, and a bug found there is cheaper
+than a bug found here.
 
 ---
 
@@ -327,17 +406,23 @@ Honest list, not marketing:
   requirement and carry no recorded origin. The audit reports them rather than inventing a cause.
   They are marked `UNVERIFIED (not promoted)`.
 - **No end-to-end run against a live model has been performed.** Everything verified here is the
-  mechanism layer, the CLI, and the agent-page contracts. The orchestration itself is unexercised.
-- **There is no worker-liveness detection.** `swarmkit` has no heartbeat, no poll, and no watchdog.
-  A worker that dies silently is indistinguishable from one that finished until you notice the
-  missing output yourself. A lease older than 15 minutes is dropped so the slot frees up, but
-  `budget show` reports **no stale/dead/reclaimed field**, so that reclamation is invisible. Treat
-  every spawn as needing a manual health check. Detecting and retrying dead workers is on the
-  roadmap, not implemented.
-- **Retry caps only hold if you call `budget retry`.** `max_retries_per_worker` is enforced when
-  `record_retry` runs, which only the explicit `budget retry` command triggers. An orchestrator that
-  forgets to record a retry is never stopped by swarmkit. The fix-cycle cap is different - that one is
-  enforced by `run phase` itself and cannot be bypassed from the CLI.
+  mechanism layer, the CLI, the agent-page contracts, and `tests/test_integration.py` - which drives
+  the real lifecycle against a mock worker adapter. The orchestration itself is unexercised.
+  See [Live-model smoke test](#live-model-smoke-test-manual-approval-required) for the procedure.
+- **Worker liveness is heartbeat + wall-clock, not process supervision.** `workers spawn` hands back an
+  `epoch`; the worker must call `workers beat` with it. A worker that stops beating past
+  `stale_seconds` is `stale`, and one that outlives its `timeout_s` is `timeout` - a worker in an
+  infinite loop cannot beat its way out of the latter. `workers reclaim` frees the slot of a
+  `stale`/`timeout` worker only; a `slow` worker that is still beating is never reclaimed.
+  **Limit:** swarmkit does not watch the pid - it trusts the beats. A worker that keeps beating but
+  makes no progress runs until `timeout_s`. There is no automatic re-spawn; you sweep with
+  `workers reclaim` and re-spawn, or let the next `workers spawn` retry it.
+- **Retries are charged inside `workers spawn`, not by a separate command.** Re-spawning a worker
+  whose predecessor is gone increments its retry counter *before* the new attempt starts, under the
+  same lock that takes the lease, so an exhausted budget stops the retry instead of starting a worker
+  that is then killed. `budget retry` still exists for manual accounting, but the cap no longer
+  depends on anyone remembering to call it. Backoff is returned as `retry_delay` on the spawn
+  result - **honouring it is the caller's job**, nothing sleeps for you.
 - **`lint` checks frontmatter only.** It validates agent pages' YAML (V2 permission actions, model
   pins, deny-before-allow ordering, command bindings). It never parses a page body, so it cannot
   verify that a documented CLI invocation actually works - `tests/test_cli.py` does that instead by

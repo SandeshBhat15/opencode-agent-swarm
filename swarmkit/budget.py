@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from .errors import BudgetExceeded, ConfigError, SwarmError
-from .store import atomic_write_json, read_json, utcnow
+from .store import LOCK_WAIT_SECONDS, atomic_write_json, file_lock, read_json, utcnow
+
+#: Guards read-modify-write cycles on budget.json across concurrent processes.
+COUNTERS_LOCK = "counters.lock"
 
 
 #: A lease older than this belongs to a process that is gone. Matches the
@@ -139,8 +142,17 @@ class Budget:
         self.spawns += 1
 
     # -- concurrency ----------------------------------------------------
-    def lease(self, name: str, *, role: str = "", run_dir: Path | None = None) -> None:
-        """Take a concurrency slot for ``name``."""
+    def lease(self, name: str, *, role: str = "", run_dir: Path | None = None,
+              epoch: str = "", attempt: int = 1,
+              timeout_s: float | None = None) -> dict[str, Any]:
+        """Take a concurrency slot for ``name``.
+
+        ``epoch`` identifies this particular execution of the worker and is
+        recorded on the lease, so a later ``release`` can prove the caller
+        still owns the slot. Without it a worker that was reclaimed and
+        restarted under a new epoch could free the slot its replacement now
+        holds.
+        """
         self.check_clock()
         if name in self.leased:
             raise BudgetExceeded(
@@ -153,11 +165,35 @@ class Budget:
                 f"in flight: {', '.join(sorted(self.leased))}",
                 code="CONCURRENCY_LIMIT",
             )
-        self.leased[name] = {"role": role, "since": utcnow()}
+        self.leased[name] = {
+            "role": role,
+            "since": utcnow(),
+            "epoch": epoch,
+            "attempt": attempt,
+            "timeout_s": timeout_s,
+        }
         if run_dir is not None:
             self._persist(run_dir)
+        return dict(self.leased[name])
 
-    def release(self, name: str, *, run_dir: Path | None = None) -> None:
+    def release(self, name: str, *, run_dir: Path | None = None,
+                epoch: str = "") -> None:
+        """Free a slot.
+
+        Idempotent for an unknown worker, so a clean shutdown cannot fail on a
+        worker that already exited. When ``epoch`` is supplied it must match
+        the lease's recorded epoch, otherwise ``LEASE_NOT_OWNED`` is raised:
+        the caller is a stale generation that would otherwise free the slot
+        its replacement now occupies.
+        """
+        held = self.leased.get(name)
+        if held is not None and epoch and held.get("epoch") != epoch:
+            raise BudgetExceeded(
+                f"worker {name!r} holds epoch {held.get('epoch')!r}, not "
+                f"{epoch!r}; refusing to release a slot owned by another "
+                f"execution (a reclaimed worker may have been restarted)",
+                code="LEASE_NOT_OWNED",
+            )
         self.leased.pop(name, None)
         if run_dir is not None:
             self._persist(run_dir)
@@ -229,6 +265,29 @@ class Budget:
 
     def _persist(self, run_dir: Path) -> None:
         atomic_write_json(Path(run_dir) / "budget.json", self.snapshot())
+
+    def update_locked(self, run_dir: Path, mutate: Any) -> Any:
+        """Read, mutate and persist this budget as one atomic operation.
+
+        Every CLI invocation is a separate process that reloads from
+        ``budget.json``, mutates, and writes back. Without a lock covering the
+        whole sequence, two processes racing (two workers spawning at once, or
+        two retries landing together) both read the same counters, both
+        increment, and the second write silently discards the first - so a
+        spawn or retry could slip past its cap entirely.
+
+        Holding ``counters.lock`` across load -> mutate -> persist closes that
+        window. ``mutate`` receives the freshly loaded Budget and may raise
+        ``BudgetExceeded`` to refuse; a refusal persists nothing.
+
+        Returns whatever ``mutate`` returns.
+        """
+        run_dir = Path(run_dir)
+        with file_lock(run_dir / COUNTERS_LOCK, timeout=LOCK_WAIT_SECONDS):
+            budget = Budget.load(run_dir, self.limits)
+            result = mutate(budget)
+            budget.persist(run_dir)
+            return result
 
     @classmethod
     def load(cls, run_dir: Path, limits: Limits | None = None) -> "Budget":

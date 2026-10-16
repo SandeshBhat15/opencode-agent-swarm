@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import contracts, gate, isolator, lessons, phases, store
+from . import contracts, gate, isolator, lessons, phases, store, workers
 from .budget import Budget, Limits
 from .errors import SwarmError
 
@@ -370,6 +370,90 @@ def cmd_budget_tokens(args: argparse.Namespace) -> int:
                  f"tokens in={budget.tokens_in} out={budget.tokens_out} cost={cost}")
 
 
+# -- workers --------------------------------------------------------------
+# `budget spawn` only ever counted. These are the commands that make a worker
+# observable: a dead worker is distinguishable from a slow one, and a retry is
+# charged to the budget inside the same critical section that starts it.
+
+
+def cmd_workers_spawn(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
+    limits = _limits_from(args, run_dir)
+    with store.mutation(run_dir, "workers.spawn", args.name):
+        result = workers.spawn(
+            run_dir,
+            args.name,
+            role=args.role,
+            timeout_s=args.timeout,
+            limits=limits,
+            pid=args.pid,
+        )
+    payload = result.to_dict()
+    payload["budget"] = Budget.load(run_dir, limits).snapshot()
+    return _emit(payload, args.json,
+                 f"spawned {args.name} attempt {result.worker.attempt} "
+                 f"epoch {result.worker.epoch[:8]} "
+                 f"(retry delay {result.retry_delay}s)")
+
+
+def cmd_workers_beat(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
+    with store.mutation(run_dir, "workers.beat", args.name):
+        registry = workers.Registry(run_dir)
+        worker = registry.heartbeat(args.name, args.epoch)
+    return _emit({"worker": worker.to_dict()}, args.json,
+                 f"beat {args.name} attempt {worker.attempt} "
+                 f"({worker.beats} total)")
+
+
+def cmd_workers_finish(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
+    with store.mutation(run_dir, "workers.finish", args.name):
+        registry = workers.Registry(run_dir)
+        worker = registry.finish(args.name, args.epoch, args.state, args.note)
+        budget = Budget.load(run_dir, _limits_from(args, run_dir))
+        budget.release(args.name, epoch=args.epoch)
+        budget.persist(run_dir)
+    return _emit({"worker": worker.to_dict()}, args.json,
+                 f"{args.name} finished {args.state}")
+
+
+def cmd_workers_status(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
+    status = workers.Registry(run_dir).status(stale_seconds=args.stale)
+    lines = [
+        f"{w['name']:<16} attempt {w['attempt']:<3} {w['state']:<9} {w['liveness']}"
+        for w in status["workers"]
+    ]
+    human = (
+        "\n".join(lines)
+        or "no workers registered"
+    ) + (
+        f"\nalive={status['alive']} slow={status['slow']} "
+        f"stale={status['stale']} timeout={status['timed_out']}"
+    )
+    return _emit(status, args.json, human)
+
+
+def cmd_workers_reclaim(args: argparse.Namespace) -> int:
+    """Free slots held by dead workers. Never touches a `slow` one."""
+    run_dir = _run_dir(Path(args.workspace).resolve(), args.slug)
+    report = workers.reclaim(
+        run_dir,
+        limits=_limits_from(args, run_dir),
+        stale_seconds=args.stale,
+        names=args.name,
+    )
+    reclaimed = ", ".join(
+        f"{r['name']}({r['liveness']},attempt {r['attempt']})" for r in report["reclaimed"]
+    )
+    skipped = ", ".join(f"{s['name']}({s['liveness']})" for s in report["skipped"])
+    human = f"reclaimed: {reclaimed or 'none'}"
+    if skipped:
+        human += f"\nleft alone: {skipped}"
+    return _emit(report, args.json, human)
+
+
 def cmd_scope_plan(args: argparse.Namespace) -> int:
     scopes: dict[str, list[str]] = {}
     for spec in args.ws:
@@ -596,6 +680,27 @@ def build_parser() -> argparse.ArgumentParser:
     bt = b.add_parser("tokens"); bt.add_argument("--in", dest="tokens_in", type=int, default=0)
     bt.add_argument("--out", dest="tokens_out", type=int, default=0)
     bt.add_argument("--slug"); bt.set_defaults(func=cmd_budget_tokens)
+
+    w = sub.add_parser("workers").add_subparsers(dest="cmd", required=True)
+    wst = w.add_parser("status"); wst.add_argument("--slug")
+    wst.add_argument("--stale", type=float, default=workers.DEFAULT_STALE_SECONDS)
+    wst.set_defaults(func=cmd_workers_status)
+    wsp = w.add_parser("spawn")
+    wsp.add_argument("--name", "--worker", dest="name", required=True)
+    wsp.add_argument("--role"); wsp.add_argument("--slug")
+    wsp.add_argument("--timeout", type=float, default=workers.DEFAULT_TIMEOUT_S)
+    wsp.add_argument("--pid", type=int); wsp.set_defaults(func=cmd_workers_spawn)
+    wbt = w.add_parser("beat"); wbt.add_argument("--name", "--worker", dest="name", required=True)
+    wbt.add_argument("--epoch", required=True); wbt.add_argument("--slug")
+    wbt.set_defaults(func=cmd_workers_beat)
+    wfi = w.add_parser("finish"); wfi.add_argument("--name", "--worker", dest="name", required=True)
+    wfi.add_argument("--epoch", required=True)
+    wfi.add_argument("--state", choices=["ok", "failed"], required=True)
+    wfi.add_argument("--note"); wfi.add_argument("--slug")
+    wfi.set_defaults(func=cmd_workers_finish)
+    wrc = w.add_parser("reclaim"); wrc.add_argument("--name", "--worker", dest="name", action="append")
+    wrc.add_argument("--stale", type=float, default=workers.DEFAULT_STALE_SECONDS)
+    wrc.add_argument("--slug"); wrc.set_defaults(func=cmd_workers_reclaim)
 
     sc = sub.add_parser("scope").add_subparsers(dest="cmd", required=True)
     sp = sc.add_parser("plan"); sp.add_argument("--ws", action="append", required=True)

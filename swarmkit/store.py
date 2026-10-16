@@ -399,46 +399,76 @@ def _clear_journal(rundir: Path) -> None:
         pass
 
 
+#: How long a caller will wait for a contended lock before giving up. Worker
+#: heartbeats and budget updates are short critical sections that legitimately
+#: collide, so they wait rather than failing.
+LOCK_WAIT_SECONDS = 5.0
+
+#: How often a waiting caller re-checks for the lock.
+LOCK_POLL_SECONDS = 0.02
+
+
 @contextmanager
-def _exclusive_lock(rundir: Path) -> Iterator[None]:
-    rundir = Path(rundir)
-    lock = rundir / LOCK_FILE
-    rundir.mkdir(parents=True, exist_ok=True)
-    acquired = False
-    for _ in range(2):
+def file_lock(path: Path, *, timeout: float = LOCK_WAIT_SECONDS,
+              stale_after: float = LOCK_STALE_SECONDS) -> Iterator[None]:
+    """Exclusive advisory lock on ``path``, waiting up to ``timeout`` seconds.
+
+    Used for short read-modify-write critical sections (budget counters, the
+    worker registry) that several processes legitimately race on. A lock older
+    than ``stale_after`` is assumed to belong to a dead process and is taken
+    over, so a crash cannot wedge the run forever.
+
+    Raises ``LockError`` (``LOCK_HELD``) if the lock is still held after the
+    timeout, or ``LOCK_STALE`` if an existing lock file is unreadable.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
         try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
             try:
-                age = time.time() - lock.stat().st_mtime
+                age = time.time() - path.stat().st_mtime
             except OSError:
-                age = 0
-            if age < LOCK_STALE_SECONDS:
+                age = stale_after  # unreadable stat: treat as stale, not fresh
+            if age >= stale_after:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
                 raise LockError(
-                    f"run {rundir.name} is locked by another process "
-                    f"(age {age:.0f}s). If that process is gone, delete {lock}.",
+                    f"{path.name} is locked by another process (age {age:.0f}s) "
+                    f"and was still held after waiting {timeout:.1f}s. "
+                    f"If that process is gone, delete {path}.",
                     code="LOCK_HELD",
-                )
-            # Stale: the holder died mid-run.
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+                ) from None
+            time.sleep(LOCK_POLL_SECONDS)
             continue
-        else:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(f"pid={os.getpid()} at={utcnow()}\n")
-            acquired = True
-            break
-    if not acquired:  # pragma: no cover - defensive
-        raise LockError(f"could not acquire {lock}", code="LOCK_HELD")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"pid={os.getpid()} at={utcnow()}\n")
+        break
     try:
         yield
     finally:
         try:
-            lock.unlink()
-        except FileNotFoundError:
+            path.unlink()
+        except OSError:
             pass
+
+
+@contextmanager
+def _exclusive_lock(rundir: Path) -> Iterator[None]:
+    """Lock a whole run directory for the duration of a ``mutation``.
+
+    Delegates to :func:`file_lock` with ``timeout=0``: a state mutation must
+    not queue behind anything, because the caller already had to pass
+    ``require_clean``. Anything else is contention worth reporting.
+    """
+    with file_lock(Path(rundir) / LOCK_FILE, timeout=0.0):
+        yield
 
 
 def recover(rundir: Path, note: str) -> dict[str, Any]:
