@@ -296,10 +296,19 @@ def require_clean(rundir: Path) -> None:
 def mutation(rundir: Path, op: str, target: str) -> Iterator[None]:
     """Bracket a state change with a journal entry + an exclusive lock.
 
-    The journal is cleared ONLY on success. If the body raises — or the
-    process is killed mid-write — the journal survives, and the next
-    ``require_clean``/``mutation`` refuses with ``RecoveryRequired`` so an
-    interrupted run is never silently resumed from half-written state.
+    Three outcomes are distinguished, because conflating them was a real bug:
+
+    * **Success** — journal cleared.
+    * **Refusal** (``SwarmError``: gate closed, illegal transition, budget
+      exceeded, scope conflict) — journal cleared too. A refusal is a *known*
+      outcome that committed nothing, so the run is not corrupt. Demanding
+      ``swarm recover`` here would make every expected QC rejection force a
+      manual recovery step before the FIX retry could even start.
+    * **Anything else** — the journal survives and the next
+      ``require_clean``/``mutation`` refuses with ``RecoveryRequired``. An
+      unexpected exception may have left real damage behind (a half-created
+      worktree, a side effect outside the atomic write), and a hard kill never
+      unwinds at all. Neither may resume silently.
     """
     rundir = Path(rundir)
     with _exclusive_lock(rundir):
@@ -308,13 +317,21 @@ def mutation(rundir: Path, op: str, target: str) -> Iterator[None]:
             journal(rundir),
             {"op": op, "target": target, "pid": os.getpid(), "at": utcnow()},
         )
-        yield
+        try:
+            yield
+        except SwarmError:
+            _clear_journal(rundir)
+            raise
         # Reached only if the body completed. Clearing last is what makes an
         # interrupt detectable: no clear, no proof of completion.
-        try:
-            journal(rundir).unlink()
-        except FileNotFoundError:
-            pass
+        _clear_journal(rundir)
+
+
+def _clear_journal(rundir: Path) -> None:
+    try:
+        journal(rundir).unlink()
+    except FileNotFoundError:
+        pass
 
 
 @contextmanager

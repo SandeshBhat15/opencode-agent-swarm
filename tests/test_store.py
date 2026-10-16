@@ -136,6 +136,43 @@ class TestJournalAndRecovery(TempWorkspace):
         self.assertIsNotNone(pending)
         self.assertIn("phase", json.dumps(pending))
 
+    def test_refusal_does_not_leave_a_journal(self) -> None:
+        """A SwarmError refusal is handled, not an interruption.
+
+        The delivery gate refusing to open is an expected outcome that commits
+        nothing. Leaving a journal there would make the next command demand a
+        manual `swarm recover`, breaking the normal QC-reject -> FIX -> QC loop.
+        """
+        run = self.make_run()
+        with self.assertRaises(SwarmError):
+            with store.mutation(run, "phase", "DELIVERED"):
+                raise SwarmError("delivery gate closed")
+        self.assertIsNone(store.pending_journal(run))
+        store.require_clean(run)  # must not raise
+
+    def test_run_is_retryable_after_a_refusal(self) -> None:
+        """A refusal leaves nothing behind that blocks the corrected retry."""
+        run = self.make_run()
+        for _ in range(3):
+            with self.assertRaises(SwarmError):
+                with store.mutation(run, "phase", "DELIVERED"):
+                    raise SwarmError("delivery gate closed")
+        with store.mutation(run, "phase", "PLAN"):
+            state = store.RunState.load(run)
+            state.phase = "PLAN"
+            state.save(run)
+        self.assertEqual(store.RunState.load(run).phase, "PLAN")
+
+    def test_unexpected_error_still_leaves_the_journal(self) -> None:
+        """Only known refusals auto-clear; a real fault must stay recoverable."""
+        run = self.make_run()
+        with self.assertRaises(ZeroDivisionError):
+            with store.mutation(run, "integrate", "reports.md"):
+                1 / 0
+        self.assertIsNotNone(store.pending_journal(run))
+        with self.assertRaises(RecoveryRequired):
+            store.require_clean(run)
+
     def test_require_clean_refuses_after_interruption(self) -> None:
         run = self.make_run()
         try:
