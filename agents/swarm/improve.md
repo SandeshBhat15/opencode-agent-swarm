@@ -100,3 +100,8 @@ Problem + verbatim proposed edit + why — or "none".
 
 ## SIGNAL
 Systemic weaknesses worth the user knowing (model limits, missing skills, tooling gaps).
+
+
+## Token/context discipline (decision engine)
+- Record lessons via `python -m swarmkit lesson add`; promote only with test evidence.
+- Propose page edits as diffs for user approval; never auto-apply.

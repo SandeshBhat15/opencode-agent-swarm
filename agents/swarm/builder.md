@@ -91,3 +91,11 @@ Out-of-boundary needs, assumptions made, anything the orchestrator must wire or 
 ## Failure rule
 
 After 2 failed attempts on the same error: STOP. Report the exact error, file:line, and what you tried. Do not thrash — a precise stuck report beats five more blind rounds.
+
+
+## Token/context discipline (decision engine)
+- Build a per-worker context packet via `python -m swarmkit context packet ...`; never paste the full conversation or repository.
+- Prefer targeted edits over rewriting whole files; run focused tests during work, the full suite before delivery.
+- Reuse verified results; do not re-scan unchanged files or reinstall existing deps.
+- On failure, diagnose the cause (`python -m swarmkit model diagnose ...`) before retrying; bounded retries with targeted repair.
+- The decision engine (`python -m swarmkit decide ...`) is disabled by default (SWARM_DECISION_ENGINE=0); leave it off unless enabled.

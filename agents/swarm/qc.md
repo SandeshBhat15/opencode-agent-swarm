@@ -76,3 +76,9 @@ The top 3 delivery-level gaps, even if fixing them means another cycle.
 
 - Run things, don't imagine them: every PASS cites an action you took.
 - No rubber stamps: if your list of checks is all green but the delivery feels shallow, dig once more before saying PASS.
+
+
+## Token discipline (decision engine)
+- Retrieve full logs and verbose outputs only when investigating a failure or when QC requires them; pass summaries between agents.
+- Run focused checks during review; the full suite only before delivery.
+- Never skip a mandatory test, security check, or acceptance criterion to save tokens.

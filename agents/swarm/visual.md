@@ -75,3 +75,9 @@ Load the matching ones per your contract — lookdev, materials, lighting, rende
 ## Output format (same as all build units)
 
 ## WHAT / ## FILES (.blend paths, exports, save locations) / ## HOW-VERIFIED (screenshots + what they show) / ## GAPS
+
+
+## Token/context discipline (decision engine)
+- Use per-worker context packets; never inject the full conversation or repository.
+- Reuse verified results; do not re-scan unchanged files.
+- The decision engine is disabled by default (SWARM_DECISION_ENGINE=0).
