@@ -50,7 +50,7 @@ jobs:
         run: node --version
 
       - name: Plugin suite (OpenCode lifecycle bridge)
-        run: node --test plugin/
+        run: node --test "plugin/**/*.js"
 
       # The worktree integration tests shell out to git; confirm git is present
       # and behaving, so a green suite is not masking an absent tool.
