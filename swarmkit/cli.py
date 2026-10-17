@@ -1184,12 +1184,37 @@ def cmd_model_import(args: argparse.Namespace) -> int:
                  f"imported {result['count']} model(s) from {result['source']}")
 
 
+def cmd_model_discover(args: argparse.Namespace) -> int:
+    """Discover models from an OpenCode /api/model payload."""
+    import json as _json
+    import tempfile
+    if args.file:
+        raw = Path(args.file).read_text(encoding="utf-8-sig")
+    else:
+        raw = sys.stdin.read()
+    data = _json.loads(raw)
+    transformed = router.transform_opencode_catalog(data)
+    tmp = Path(tempfile.mktemp(suffix=".json"))
+    tmp.write_text(_json.dumps(transformed), encoding="utf-8")
+    try:
+        registry = _registry_root(Path(args.workspace).resolve())
+        result = router.import_catalog(tmp, "opencode-api", registry=registry)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return _emit(result, args.json,
+                  f"discovered {result['count']} model(s) from OpenCode")
+
+
 def cmd_model_route(args: argparse.Namespace) -> int:
     registry = _registry_root(Path(args.workspace).resolve())
     decision = router.route(
         args.category,
         registry=registry,
         pin=args.pin,
+        default=args.allow,
         budget_remaining=args.budget_remaining,
         accept_unknown_price=args.accept_unknown_price,
     )
@@ -1794,6 +1819,9 @@ def build_parser() -> argparse.ArgumentParser:
     mi = mds.add_parser("import", help="import a host model catalog")
     mi.add_argument("--file", required=True); mi.add_argument("--source", default="host")
     mi.set_defaults(func=cmd_model_import)
+    mdis = mds.add_parser("discover", help="discover models from an OpenCode /api/model payload")
+    mdis.add_argument("--file"); mdis.add_argument("--workspace", default=".")
+    mdis.set_defaults(func=cmd_model_discover)
     mr = mds.add_parser("route", help="choose a model for a category, or refuse with a reason")
     mr.add_argument("--task", required=True); mr.add_argument("--objective", required=True)
     mr.add_argument("--role", required=True)
@@ -1902,7 +1930,7 @@ def build_parser() -> argparse.ArgumentParser:
     # the agent pages call them in; the dest is shared, so `swarmkit --json X`
     # keeps working unchanged.
     for leaf in (mi, mr, mn, mdg, mrec, mh, mb, cxp, cxsx, cxf,
-                 dd, dr, kc, kl, kf, tse, trl, tc, tb, dcc, dcd):
+                 dd, dr, kc, kl, kf, tse, trl, tc, tb, dcc, dcd, mdis):
         # SUPPRESS, not False: a leaf default of False would overwrite a
         # top-level `--json` (subparsers parse into a fresh namespace whose
         # every attribute is copied back), silently turning JSON off.

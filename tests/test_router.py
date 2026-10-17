@@ -322,5 +322,47 @@ class TestJudging(RouterCase):
         self.assertEqual(verdict["status"], "ok")
 
 
+class TestTransformOpenCodeCatalog(unittest.TestCase):
+    """Auto-discovery: transform OpenCode's /api/model payload."""
+
+    def test_transforms_opencode_shape(self) -> None:
+        payload = {
+            "location": {"directory": "C:\\\\x"},
+            "data": [
+                {
+                    "id": "good",
+                    "modelID": "good",
+                    "providerID": "opencode",
+                    "status": "active",
+                    "enabled": True,
+                    "capabilities": {"tools": True, "input": ["text", "image"], "output": ["text"], "temperature": True},
+                    "cost": [{"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}],
+                },
+                {
+                    "id": "disabled",
+                    "modelID": "disabled",
+                    "providerID": "opencode",
+                    "status": "active",
+                    "enabled": False,
+                    "capabilities": {"tools": True, "input": ["text"]},
+                    "cost": [{"input": 0, "output": 0}],
+                },
+            ],
+        }
+        out = router.transform_opencode_catalog(payload)
+        self.assertIn("models", out)
+        self.assertEqual(len(out["models"]), 1)
+        m = out["models"][0]
+        self.assertEqual(m["provider"], "opencode")
+        self.assertEqual(m["model"], "good")
+        self.assertEqual(m["capabilities"].get("tools"), True)
+        self.assertEqual(m["capabilities"].get("text"), True)
+        self.assertEqual(m["capabilities"].get("vision"), True)
+
+    def test_empty_payload_raises(self) -> None:
+        with self.assertRaises(Exception):
+            router.transform_opencode_catalog({"data": []})
+
+
 if __name__ == "__main__":
     unittest.main()

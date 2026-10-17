@@ -327,6 +327,68 @@ def catalog_path(registry: Path | str = DEFAULT_REGISTRY) -> Path:
     return Path(registry) / CATALOG_FILE
 
 
+def transform_opencode_catalog(data: Any) -> dict[str, Any]:
+    """Transform OpenCode's ``/api/model`` response into a router catalog.
+
+    OpenCode reports capabilities as ``{"tools": bool, "input": [..], "output": [..]}``
+    and prices per-token; the router expects ``{"text": bool, "tools": bool, ...}``
+    and per-million-token prices. We only carry forward what OpenCode confirms;
+    everything else stays unknown (None) rather than being defaulted.
+    """
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        records = data["data"]
+    elif isinstance(data, list):
+        records = data
+    elif isinstance(data, dict) and "models" in data:
+        records = data["models"]
+    else:
+        raise ConfigError("expected an OpenCode /api/model payload", code="CONFIG_INVALID")
+
+    out: list[dict[str, Any]] = []
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            continue
+        provider = str(raw.get("providerID") or raw.get("provider") or "")
+        model = str(raw.get("modelID") or raw.get("id") or raw.get("model") or "")
+        if not provider or not model:
+            continue
+        if raw.get("enabled") is False or raw.get("status") not in (None, "active"):
+            continue
+        caps_raw = raw.get("capabilities") or {}
+        caps: dict[str, Any] = {}
+        if isinstance(caps_raw, Mapping):
+            if caps_raw.get("tools") is True:
+                caps["tools"] = True
+            inputs = caps_raw.get("input")
+            if isinstance(inputs, (list, tuple)):
+                if "text" in inputs:
+                    caps["text"] = True
+                if "image" in inputs or "video" in inputs:
+                    caps["vision"] = True
+        # price: OpenCode reports per-token; convert to per-million.
+        price_in = None
+        price_out = None
+        cost = raw.get("cost")
+        if isinstance(cost, list) and cost:
+            c0 = cost[0]
+            if isinstance(c0, Mapping):
+                if "input" in c0 and c0["input"] is not None:
+                    price_in = float(c0["input"]) * 1_000_000
+                if "output" in c0 and c0["output"] is not None:
+                    price_out = float(c0["output"]) * 1_000_000
+        out.append({
+            "provider": provider,
+            "model": model,
+            "status": str(raw.get("status") or "active"),
+            "capabilities": caps,
+            "price_in_per_mtok": price_in,
+            "price_out_per_mtok": price_out,
+        })
+    if not out:
+        raise ConfigError("no usable models in the payload", code="CONFIG_INVALID")
+    return {"models": out}
+
+
 def import_catalog(path: Path | str, source: str, *, registry: Path | str = DEFAULT_REGISTRY) -> dict[str, Any]:
     """Read a host catalog and persist it verbatim (unknowns preserved).
 
