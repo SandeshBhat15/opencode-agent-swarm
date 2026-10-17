@@ -38,6 +38,20 @@ jobs:
       - name: Unit + integration suite
         run: python -m unittest discover -s tests -t . -v
 
+      # The lifecycle plugin ships in this repo and is therefore this repo's
+      # problem: a change that breaks its contract with the CLI must fail here,
+      # not in someone's OpenCode session. The suite shells out to Python (the
+      # real CLI, for the contract test) and to the stub engine, so it needs
+      # nothing installed - both GitHub runners already provide Node. No
+      # continue-on-error: a red plugin suite here is a real defect, and the
+      # tests it would hide are exactly the ones that caught four silent
+      # plugin/CLI mismatches during development.
+      - name: Node is present
+        run: node --version
+
+      - name: Plugin suite (OpenCode lifecycle bridge)
+        run: node --test plugin/
+
       # The worktree integration tests shell out to git; confirm git is present
       # and behaving, so a green suite is not masking an absent tool.
       - name: Git available

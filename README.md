@@ -14,9 +14,10 @@ Works across domains: web/apps · games · Blender 3D/video · AR/Lens Studio ·
 |---|---|
 | **Orchestrator** | `agents/swarm.md` — triage, plan, delegate, integrate, gate, deliver |
 | **5 specialists** | `agents/swarm/{researcher,builder,visual,qc,improve}.md` |
-| **2 commands** | `/swarm <task>` and `/swarm-status` |
+| **3 commands** | `/swarm <task>`, `/swarm-status`, `/swarm-resume` |
 | **`swarmkit/`** | The mechanism layer. A stdlib-only Python package that makes the protocol *enforceable* |
-| **`tests/`** | 408 tests, no network, no API spend |
+| **`plugin/`** | Optional OpenCode plugin that binds session events to the task lifecycle — see [`plugin/README.md`](plugin/README.md) |
+| **`tests/`** | 482 tests, no network, no API spend |
 
 ### Why `swarmkit` exists
 
@@ -59,8 +60,18 @@ agents/swarm.md            → agents/swarm.md          # orchestrator
 agents/swarm/*.md          → agents/swarm/            # 5 specialists
 commands/swarm.md          → commands/swarm.md        # /swarm
 commands/swarm-status.md   → commands/swarm-status.md # /swarm-status
+commands/swarm-resume.md   → commands/swarm-resume.md # /swarm-resume
 swarm-lessons.md           → swarm-lessons.md         # cross-run lessons ledger
 ```
+
+### Optional: the lifecycle plugin
+
+`plugin/swarm-lifecycle.js` binds OpenCode's real session events to the task lifecycle below,
+so work stops when a chat closes without anyone having to remember to stop it. Install it in
+**exactly one** place — either `~/.config/opencode/plugins/` (all projects) or a project's
+`.opencode/plugins/` (this repo already ships a re-export shim at that path). Installing both
+means two module instances, two install guards, and every lifecycle action firing twice. Full
+details, measured facts and the test story: [`plugin/README.md`](plugin/README.md).
 
 Then make the orchestrator your default agent in `opencode.json(c)`:
 
@@ -174,6 +185,130 @@ REPORT BACK: WHAT / FILES / HOW-VERIFIED / GAPS
 
 A failed spawn retries once, then reroutes the **whole contract inline** to a `general` executor —
 never a pointer to "the context above".
+
+---
+
+## Session-bound execution
+
+A run assumes you are still in the chair. A **task** is the layer above it: a unit of work bound
+to the OpenCode session that asked for it, so work that will not finish in one turn can be
+stopped when that conversation ends instead of quietly burning tokens and writing files for a
+user who has gone.
+
+```sh
+python -m swarmkit lifecycle start --session <session-id> --goal "<one sentence>" \
+    --plan '[{"id": "build"}, {"id": "verify"}]'
+```
+
+`--session` is not optional. A task with no owning session could not be stopped when its
+conversation closed, which is the entire reason this layer exists. State lives in
+`.opencode/swarm-lifecycle/tasks/<task_id>/task.json` with a `checkpoints.jsonl` journal beside
+it, deliberately outside `.opencode/swarm/` so reconciling a run directory cannot delete a task.
+
+### Eight states, not a boolean
+
+| State | Means |
+| --- | --- |
+| `RUNNING` | owned by a live session, executing now |
+| `CANCELLING` | stop asked for, children not all dead yet — observable, and waitable on |
+| `PAUSED` | stopped **on purpose**; completed steps and artifacts intact, resumable |
+| `INTERRUPTED` | cut off without anyone choosing to stop it; resumable, but re-verify first |
+| `RESUMING` | handed to a new attempt; the previous epoch is fenced out |
+| `BLOCKED` | waiting on something outside the work |
+| `FAILED` | the attempt failed; resumable, retries recorded |
+| `COMPLETED` | every planned step done and no child running; terminal — nothing leaves it |
+
+`PAUSED` and `INTERRUPTED` are deliberately different states. The first means somebody decided to
+stop; the second means nobody did — which is the difference between a routine resume and one
+that re-verifies before trusting what it finds.
+
+### Closing one session is not closing the application
+
+Two sessions can be mid-task in one project, so these are two commands, not one:
+
+```sh
+python -m swarmkit lifecycle session-close --session <session-id> --reason "user closed the chat"
+python -m swarmkit lifecycle shutdown --reason "application shutdown"
+```
+
+- `session-close` stops **only** what that session owns, and reports every other session's tasks
+  as `untouched`.
+- `shutdown` stops every task this application still owns, and reports the already-stopped ones
+  as `preserved`.
+
+Neither deletes anything. Records, completed steps and artifacts outlive the session that
+produced them until `lifecycle prune` is run by hand. Cancellation is idempotent, because a
+session event, a shutdown hook and the user can all request the same stop at once.
+
+### Durable checkpoints, plus a journal
+
+Every transition writes `task.json` atomically (temp file → fsync → rename) **and** appends the
+same state to `checkpoints.jsonl` with a monotonic sequence. A crash *between* the two would
+leave the record behind the journal, so recovery replays any journal entry newer than the
+record's own sequence — the journal, not the record, is the authority on what was last
+confirmed.
+
+```sh
+python -m swarmkit lifecycle checkpoint --task <id> --step <step-id> --epoch <epoch> \
+    --artifact <path> --result "<what it produced>"
+```
+
+`<epoch>` is the task epoch `lifecycle status` reports. Passing it fences a write from a
+superseded attempt.
+
+Progress is counted from the plan and the completed set, never from an event count, so it cannot
+claim work that did not happen.
+
+### Resume is on request, never on reopen
+
+`lifecycle recover` marks work whose owner process is gone as `INTERRUPTED` and **stops there**.
+Reopening the application is not the user asking to continue, and a recovery routine that
+helpfully restarts everything it finds is worse than one that does nothing.
+
+`lifecycle resume-plan` finds the task a "continue" probably means and returns a brief while
+changing nothing. More than one match returns `ambiguous`, and the caller asks one question
+instead of guessing. Only `lifecycle resume` actually starts work:
+
+```sh
+python -m swarmkit lifecycle resume-plan --session <session-id> --hint "finish the migration"
+python -m swarmkit lifecycle resume --task <id> --session <session-id>
+```
+
+### Stale attempts are fenced by epoch
+
+Cancel and resume both mint a new epoch. A worker still running from the previous attempt that
+finally reports a result is refused with `EPOCH_MISMATCH` — otherwise cancelled work resurrects
+itself through its own late write. The same reasoning covers `workers spawn`'s per-worker epoch.
+
+### Completion is earned
+
+A task with steps outstanding cannot be moved to `COMPLETED` (`INCOMPLETE`), one with a running
+child cannot either, and `CANCELLING` has no edge to `COMPLETED` at all. A partially executed
+task can never be reported as done.
+
+### The commands
+
+`--json` and `--workspace` are global and come **before** the subcommand:
+`python -m swarmkit --json lifecycle status --task t1`.
+
+| Subcommand | What it does |
+| --- | --- |
+| `lifecycle start` | bind a new task to the session that asked for it (`--task --goal --project --parent --plan`) |
+| `lifecycle checkpoint` | persist progress durably (`--step --phase --artifact --retry --epoch --result --event`) |
+| `lifecycle status` | real progress for one task, or for a session's task (`--task` or `--session`) |
+| `lifecycle list` | every task on record |
+| `lifecycle note` | count one real host event (`--task` or `--session --event`) |
+| `lifecycle cancel` | stop one task now; idempotent (`--reason`) |
+| `lifecycle resume-plan` | find the task a "continue" means; starts nothing |
+| `lifecycle resume` | continue a task after the user asks (`--session --hint`) |
+| `lifecycle prune` | drop expired records (`--retention-days`); artifacts are never touched |
+| `lifecycle session-close` | host-driven: stop the work one session owns (`--session --reason`) |
+| `lifecycle shutdown` | host-driven: stop every task this application owns (`--reason`) |
+| `lifecycle recover` | host-driven: mark crashed work `INTERRUPTED`; never resumes it (`--reason`) |
+
+The last three are what the [plugin](plugin/README.md) calls on session close, application
+shutdown and startup. They are not exposed to the agent: one that could fire them could cancel
+another session's work or force a resume nobody asked for.
 
 ---
 
@@ -377,14 +512,21 @@ diff.
 ## Running the tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 408 tests
+python -m unittest discover -s tests -t .     # 482 tests
 python -m swarmkit lint --root .              # contract lint over agents/ and commands/
-python -m swarmkit selftest                   # quick end-to-end gate check
+python -m swarmkit selftest                   # quick end-to-end gate + lifecycle check
+node --test plugin/swarm-lifecycle.test.js    # 24 plugin tests (simulated - see below)
 ```
 
 No network, no credentials, no API spend. Model calls are never made by `swarmkit`, so there is
 nothing to mock. External model behaviour is covered by contract tests over the agent pages instead —
 see `tests/test_contracts.py`.
+
+The plugin suite needs Node and no install step. Every test in it is **simulated**: a fake `ctx`
+and a stub Python engine that records argv and prints canned JSON. It proves the plugin's half of
+the contract — which command it builds, which flags it forwards — plus one test that shells out to
+the real `python -m swarmkit lifecycle <action> --help`. The live-server half is the verification
+reported in [`plugin/README.md`](plugin/README.md) and cannot be reproduced from CI.
 
 > On Windows PowerShell, a successful run can still report exit code 1 because unittest writes its
 > summary to stderr. Read the `OK` / `FAILED` line, not the exit code.
@@ -421,6 +563,11 @@ non-blocking job probes Python 3.12.
 | `NO_SUCH_WORKTREE` | `iso --ws` name is unknown. The message lists the workstreams the manifest actually holds |
 | `BAD_USAGE` on `run phase` | Neither a positional phase nor `--to` was given, or the two disagreed |
 | Worker appears hung | `workers status` classifies each worker `alive`/`slow`/`stale`/`timeout`. A `slow` worker is beating and is fine; a `stale` one stopped beating. `workers reclaim --name X` frees a dead worker's slot, then re-spawn it |
+| `NO_SUCH_TASK` | The lifecycle has no record of that task id in this workspace. `lifecycle list` shows every task on record |
+| `INCOMPLETE` on completion | An engine refusal (`Task.set_state`): the task has steps outstanding, a child still running, or is stopping. A partially executed task is refused `COMPLETED` on purpose - cancel it and resume instead. The CLI has no command that declares a task finished |
+| `TASK_NOT_RUNNING` on `lifecycle checkpoint --step` | A step arrived for a `PAUSED`/`INTERRUPTED` task. A stopped task does not execute, so resume it before recording steps |
+| `TASK_CANCELLED` on `lifecycle checkpoint --step` | The task is `CANCELLING` (a cancellation that was interrupted before it finished). Progress is not written into work the user asked to stop |
+| `EPOCH_MISMATCH` on `lifecycle checkpoint` | The write carried an epoch from a superseded attempt. Use the epoch `lifecycle resume` or `lifecycle status` reports now |
 
 ### Worker liveness and retries
 
@@ -556,6 +703,10 @@ than a bug found here.
   audit every page used `action: bash`, which **matched nothing**, so all 22 shell guardrails in the
   repo silently fell through to the base allow. `swarmkit lint` now makes that class of mistake a
   hard error (`SW003`).
+- **The lifecycle plugin:** verified against a live **OpenCode 2.0.32** server, including the event
+  envelope shape and the fact that OpenCode hands each `setup()` call a fresh module instance. The
+  measurements are recorded next to the code that depends on them; see
+  [`plugin/README.md`](plugin/README.md).
 - **Python:** 3.11+ claimed, **verified on 3.14.0 only.** The code uses no syntax or stdlib newer than
   3.11 (checked by hand). 3.12 and 3.13 are **not installed on this machine and were never run**, so
   CI probes them non-blockingly. Treat older-Python support as unverified until that probe is green.
@@ -570,6 +721,10 @@ Honest list, not marketing:
 
 - **Token and cost tracking is manual.** `budget tokens --in N --out N` records usage; `swarmkit`
   cannot read it from the provider, so nothing feeds it automatically.
+- **No CLI command marks a task `COMPLETED`.** The completion guard is enforced in the engine
+  (`Task.set_state` refuses `INCOMPLETE`), so a library caller cannot lie about it either — but
+  nothing in the CLI declares a task finished, which means delivery is still judged by the run
+  gate, not by the task state.
 - **Cost is unknown by default.** Without configured `price_*_per_mtok`, `estimated_cost_usd` is
   `null`. It is never guessed.
 - **Overlap detection is conservative.** Two globs that cannot be *proven* disjoint report `possible`,
@@ -578,6 +733,14 @@ Honest list, not marketing:
 - **Three shipped lessons are `ungrounded`.** The original three entries predate the `--failure`
   requirement and carry no recorded origin. The audit reports them rather than inventing a cause.
   They are marked `UNVERIFIED (not promoted)`.
+- **Task records are never pruned automatically.** `lifecycle prune` is the only thing that deletes
+  them, and nothing calls it on a timer — a lifecycle file that deletes itself is how a user loses
+  the ability to resume. The cost of that choice is unbounded growth of
+  `.opencode/swarm-lifecycle/` if you never run it.
+- **The plugin's own tests are simulated.** `node --test plugin/swarm-lifecycle.test.js` runs
+  against a fake `ctx` and a stub engine. The live OpenCode 2.0.32 verification described in
+  [`plugin/README.md`](plugin/README.md) is a manual observation recorded in the source, not
+  something CI reproduces.
 - **No end-to-end run against a live model has been performed.** Everything verified here is the
   mechanism layer, the CLI, the agent-page contracts, and `tests/test_integration.py` - which drives
   the real lifecycle against a mock worker adapter. The orchestration itself is unexercised.

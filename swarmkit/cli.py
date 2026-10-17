@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import (analysis, contracts, evolve, experience, gate, isolator,
-               lessons, manager, phases, store, workers)
+               lessons, lifecycle, manager, phases, store, workers)
 from .budget import Budget, Limits
 from .errors import SwarmError
 
@@ -799,6 +799,264 @@ def cmd_lesson_audit(args: argparse.Namespace) -> int:
     return _emit(result, args.json, human)
 
 
+def _parse_plan(raw: str | None) -> list[dict[str, Any]]:
+    """Parse a ``--plan`` argument into steps, refusing bad input cleanly.
+
+    A raw ``JSONDecodeError`` here would escape :func:`main`, which only catches
+    ``SwarmError``, and the caller would get a traceback instead of the
+    ``{"error": {"code": ...}}`` envelope every other failure returns. The
+    plugin parses the host's JSON too, so this path is reachable from a real
+    integration, not just from a mistyped flag.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SwarmError(
+            f"--plan is not valid JSON: {exc}", code="BAD_PLAN"
+        ) from exc
+    if not isinstance(parsed, list):
+        raise SwarmError(
+            f"--plan must be a JSON list of steps, got {type(parsed).__name__}",
+            code="BAD_PLAN",
+        )
+    return [step for step in parsed if isinstance(step, dict)]
+
+
+def cmd_lifecycle_session_close(args: argparse.Namespace) -> int:
+    """Stop the work one session owns when that session ends.
+
+    The plugin calls this from the session-close event. It is a separate command
+    from ``lifecycle shutdown`` because closing one chat is not closing the
+    application, and a user running two sessions at once must not have one
+    closed conversation take the other one's work with it.
+    """
+    result = lifecycle.session_close(
+        Path(args.workspace), args.session, reason=args.reason or "session closed"
+    )
+    human = (
+        f"session {args.session}: cancelled {result['cancelled']} task(s); "
+        f"{len(result['untouched'])} belonging to other sessions left running"
+    )
+    return _emit(result, args.json, human)
+
+
+def cmd_lifecycle_shutdown(args: argparse.Namespace) -> int:
+    """Stop every task this application owns, on real process shutdown.
+
+    This is the cleanup function the OpenCode plugin returns from ``setup()``.
+    It fires when the application itself goes away, which is the only moment at
+    which every session in the process is ending together. Nothing is deleted:
+    each record keeps its completed work and artifacts for a later resume.
+    """
+    result = lifecycle.shutdown(
+        Path(args.workspace), reason=args.reason or "application shutdown"
+    )
+    human = f"shutdown: cancelled {result['cancelled']} live task(s); preserved {len(result['preserved'])}"
+    return _emit(result, args.json, human)
+
+
+def cmd_lifecycle_status(args: argparse.Namespace) -> int:
+    """Real progress for one task, or for whatever a session is running.
+
+    With ``--session`` there may be more than one candidate, and picking one
+    would be a guess. An ambiguous session therefore answers with ``task: null``
+    plus the candidates: a caller that renders progress has nothing truthful to
+    show, and silence beats a confident number about the wrong task.
+    """
+    workspace = Path(args.workspace)
+    if args.task:
+        task = lifecycle.Task.load(workspace, args.task)
+        return _emit({"task": task.progress()}, args.json, (
+            f"task {task.record.task_id}: {task.record.state} "
+            f"{task.record.completed_steps}/{task.record.total_steps} steps"
+        ))
+    if not args.session:
+        raise SwarmError("status needs --task or --session", code="NO_TASK")
+    live = [t for t in lifecycle.Task.for_session(workspace, args.session)
+            if t.record.state in lifecycle.LIVE_STATES]
+    if len(live) == 1:
+        return _emit({"task": live[0].progress()}, args.json, (
+            f"task {live[0].record.task_id}: {live[0].record.state} "
+            f"{live[0].record.completed_steps}/{live[0].record.total_steps} steps"
+        ))
+    if not live:
+        # Stopped or never started: still the truth worth reporting.
+        known = lifecycle.Task.for_session(workspace, args.session)
+        result = {"task": known[0].progress() if known else None,
+                  "tasks": [t.progress() for t in known]}
+        return _emit(result, args.json, "no live task in this session")
+    return _emit(
+        {"task": None, "ambiguous": True,
+         "tasks": [t.progress() for t in live],
+         "session_id": args.session},
+        args.json,
+        f"{len(live)} live tasks in this session; refusing to guess",
+    )
+
+
+def cmd_lifecycle_list(args: argparse.Namespace) -> int:
+    result = {
+        "tasks": [
+            {
+                "task_id": t.record.task_id,
+                "session_id": t.record.session_id,
+                "state": t.record.state,
+                "completed_steps": t.record.completed_steps,
+                "total_steps": t.record.total_steps,
+                "goal": t.record.goal,
+            }
+            for t in lifecycle.Task.all(Path(args.workspace))
+        ]
+    }
+    return _emit(result, args.json, f"{len(result['tasks'])} task(s) on record")
+
+
+def cmd_lifecycle_start(args: argparse.Namespace) -> int:
+    """Bind a new task to the session that asked for it.
+
+    Every task must name an owning session. That is what makes the rest of the
+    lifecycle possible: a task with no owner could not be stopped when its
+    conversation closed, which is the failure this whole module exists to stop.
+    """
+    if not args.session:
+        raise SwarmError(
+            "--session is required: a task must name the session that owns it",
+            code="NO_SESSION",
+        )
+    plan = _parse_plan(args.plan)
+    task = lifecycle.Task.create(
+        Path(args.workspace),
+        task_id=args.task or "",
+        session_id=args.session,
+        goal=args.goal or "",
+        project=args.project or str(Path(args.workspace)),
+        parent_task_id=args.parent,
+        plan=plan,
+    )
+    result = {"task": task.progress()}
+    return _emit(result, args.json, f"task {task.record.task_id} bound to session {args.session}")
+
+
+def cmd_lifecycle_checkpoint(args: argparse.Namespace) -> int:
+    """Persist a checkpoint. Called on every step, so a crash loses at most one."""
+    task = lifecycle.Task.load(Path(args.workspace), args.task)
+    if args.step:
+        task.complete_step(args.step, result=args.result or None, epoch=args.epoch or "")
+    if args.phase:
+        task.record.phase = args.phase
+    if args.artifact:
+        task.record.artifacts.append(args.artifact)
+    if args.retry:
+        key, _, count = args.retry.partition("=")
+        task.record.retries[key] = int(count or task.record.retries.get(key, 0) + 1)
+    entry = task.checkpoint(event=args.event or "checkpoint")
+    result = {"task": task.progress(), "checkpoint": entry["seq"], "at": entry["at"]}
+    return _emit(result, args.json, f"checkpoint {entry['seq']} at {entry['at']}")
+
+
+def cmd_lifecycle_note(args: argparse.Namespace) -> int:
+    """Count one real event from the host application.
+
+    Counters only. An event name we do not model is still recorded rather than
+    dropped, because an unrecognised event is evidence about what the host is
+    doing, and discarding it would leave a gap we could not explain later.
+
+    Addressed by ``--session`` as well as ``--task`` because the host reports
+    events per session, not per task, and making the caller look up the task id
+    first would be a step that has to be right every time.
+    """
+    if args.task:
+        task = lifecycle.Task.load(Path(args.workspace), args.task)
+    elif args.session:
+        live = [
+            t for t in lifecycle.Task.for_session(Path(args.workspace), args.session)
+            if t.record.state in lifecycle.LIVE_STATES
+        ]
+        if len(live) != 1:
+            # Zero or several live tasks for one session: picking one would be a
+            # guess, and a guessed task gets its counters written.
+            return _emit(
+                {"noted": False, "session_id": args.session, "event": args.event,
+                 "live_tasks": [t.record.task_id for t in live]},
+                args.json,
+                f"no single live task for session {args.session}; "
+                f"{len(live)} candidate(s) - pass --task",
+            )
+        task = live[0]
+    else:
+        raise SwarmError("note needs --task or --session", code="NO_TASK")
+    observed = task.note(args.event)
+    result = {"task_id": task.record.task_id, "observed": observed, "noted": True}
+    return _emit(result, args.json, f"{args.event}: {observed.get(args.event, 0)}")
+
+
+def cmd_lifecycle_cancel(args: argparse.Namespace) -> int:
+    result = lifecycle.Task.load(Path(args.workspace), args.task).cancel(
+        reason=args.reason or "cancelled"
+    )
+    return _emit(result, args.json, f"task {args.task}: {result['state']}")
+
+
+def cmd_lifecycle_resume_plan(args: argparse.Namespace) -> int:
+    """Report the unfinished task a "continue" probably means. Starts nothing.
+
+    The separation is the point. Finding the task is safe to do automatically;
+    restarting it is not, so this command only ever produces a brief and the
+    caller has to invoke ``lifecycle resume`` separately.
+    """
+    result = lifecycle.resume_plan(
+        Path(args.workspace),
+        session_id=args.session or "",
+        project=args.project or "",
+        hint=args.hint or "",
+    )
+    if result["status"] == "ambiguous":
+        human = "ambiguous; ask which one: " + ", ".join(
+            f"{c['task_id']} ({c['progress']})" for c in result["candidates"]
+        )
+    elif result["status"] == "none":
+        human = "no unfinished task for this project"
+    else:
+        human = f"task {result['task_id']} at {result['progress']}"
+    return _emit(result, args.json, human)
+
+
+def cmd_lifecycle_resume(args: argparse.Namespace) -> int:
+    """Continue a task. The only path that leaves PAUSED or INTERRUPTED.
+
+    Reuses the completed work rather than repeating it, rotates the epoch so any
+    worker left over from the previous attempt is fenced out, and hands back a
+    brief built from the durable record.
+    """
+    task = lifecycle.Task.load(Path(args.workspace), args.task)
+    task.resume(session_id=args.session or task.record.session_id, hint=args.hint or "")
+    result = {"task": task.progress(), "brief": task.brief()}
+    human = f"resumed {args.task}: {task.record.completed_steps}/{task.record.total_steps} steps already done"
+    return _emit(result, args.json, human)
+
+
+def cmd_lifecycle_recover(args: argparse.Namespace) -> int:
+    """Mark crashed work INTERRUPTED. Never resumes it.
+
+    Called on plugin startup. A task whose owner process is gone gets recorded
+    as interrupted so that a later resume knows to re-verify it rather than
+    trusting the last run -- and nothing is restarted here, because the
+    application reopening is not the user asking to continue.
+    """
+    result = lifecycle.recover(Path(args.workspace), reason=args.reason or "startup")
+    human = f"recovered {result['recovered']} interrupted task(s); {len(result['skipped'])} skipped"
+    return _emit(result, args.json, human)
+
+
+def cmd_lifecycle_prune(args: argparse.Namespace) -> int:
+    """Drop expired records. Never artifacts, never live work, never automatic."""
+    result = lifecycle.prune(Path(args.workspace), retention_days=args.retention_days)
+    human = f"pruned {len(result['removed'])} expired record(s); kept {len(result['kept'])} live"
+    return _emit(result, args.json, human)
+
+
 def cmd_lint(args: argparse.Namespace) -> int:
     pages = contracts.validate_repo(Path(args.root))
     summary = contracts.summarise(pages)
@@ -823,6 +1081,44 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             raise SwarmError("gate opened with no evidence", code="GATE_LEAK")
         gate.add_evidence(run_dir, gate.Evidence("C1", "pass", "pytest", "12 passed"))
         assert gate.assert_open(run_dir).open
+
+        # -- session-bound lifecycle. No subprocess and no sleep: everything
+        # below is either a refusal or on-disk state, both decided at once.
+        task = lifecycle.Task.create(
+            ws, task_id="selftest", session_id="ses_selftest",
+            goal="a task that outlives the turn", plan=[{"id": "s1"}, {"id": "s2"}],
+        )
+        task.complete_step("s1", result="done")
+        assert task.record.completed_steps == 1, "the completed step is not on record"
+        try:
+            task.set_state(lifecycle.COMPLETED)
+        except SwarmError:
+            pass  # half-done work is never reported as done
+        else:
+            raise SwarmError(
+                "a half-executed task was marked COMPLETED", code="COMPLETION_LEAK"
+            )
+        try:
+            task.complete_step("s2", epoch="epoch-from-a-superseded-attempt")
+        except SwarmError:
+            pass  # a superseded attempt cannot write its result
+        else:
+            raise SwarmError(
+                "a superseded epoch recorded progress", code="FENCE_LEAK"
+            )
+        artifact = ws / "selftest-artifact.txt"
+        artifact.write_text("produced", encoding="utf-8")
+        task.record.artifacts.append(str(artifact))
+        report = task.cancel(reason="selftest stop")
+        assert report["state"] == lifecycle.PAUSED
+        assert task.record.completed_steps == 1, "cancel must keep the completed step"
+        assert artifact.exists(), "cancel must not delete a finished artifact"
+        assert task.file.exists(), "cancel must not delete the saved state"
+        recovery = lifecycle.recover(ws, reason="selftest")
+        assert recovery["recovered"] == 0, "recovery must not touch stopped work"
+        assert lifecycle.Task.load(ws, "selftest").record.state == lifecycle.PAUSED, (
+            "recover marks interrupted work, it never resumes it"
+        )
     return _emit({"selftest": "ok"}, args.json, "selftest ok")
 
 
@@ -1038,6 +1334,51 @@ def build_parser() -> argparse.ArgumentParser:
     vh.add_argument("--limit", type=int, default=20); vh.set_defaults(func=cmd_evolve_history)
     vsc = ves.add_parser("scope-check", help="refuse a self-evolution edit of a protected path")
     vsc.add_argument("--path", action="append"); vsc.set_defaults(func=cmd_evolve_scope_check)
+
+    lc = sub.add_parser("lifecycle", help="session-bound task ownership and shutdown")
+    lcs = lc.add_subparsers(dest="cmd", required=True)
+    lsc = lcs.add_parser("session-close", help="stop the work one session owns")
+    lsc.add_argument("--session", required=True); lsc.add_argument("--reason")
+    lsc.set_defaults(func=cmd_lifecycle_session_close)
+    lsd = lcs.add_parser("shutdown", help="stop every task this application owns")
+    lsd.add_argument("--reason"); lsd.set_defaults(func=cmd_lifecycle_shutdown)
+    lst = lcs.add_parser("status", help="real progress for one task, or for a session's task")
+    # The host plugin only knows the session it is watching, never the task id,
+    # so `--session` has to be a first-class way in. Resolved inside the command
+    # so that an ambiguous session reports the ambiguity instead of picking one.
+    lst.add_argument("--task"); lst.add_argument("--session")
+    lst.set_defaults(func=cmd_lifecycle_status)
+    lli = lcs.add_parser("list", help="every task on record")
+    lli.set_defaults(func=cmd_lifecycle_list)
+    lsa = lcs.add_parser("start", help="bind a new task to its owning session")
+    lsa.add_argument("--session", required=True); lsa.add_argument("--task")
+    lsa.add_argument("--goal"); lsa.add_argument("--project"); lsa.add_argument("--parent")
+    lsa.add_argument("--plan", help="JSON list of steps")
+    lsa.set_defaults(func=cmd_lifecycle_start)
+    lcp = lcs.add_parser("checkpoint", help="persist progress durably")
+    lcp.add_argument("--task", required=True); lcp.add_argument("--step")
+    lcp.add_argument("--phase"); lcp.add_argument("--artifact")
+    lcp.add_argument("--retry", help="key=count"); lcp.add_argument("--epoch")
+    lcp.add_argument("--result"); lcp.add_argument("--event")
+    lcp.set_defaults(func=cmd_lifecycle_checkpoint)
+    lno = lcs.add_parser("note", help="count one real host event")
+    lno.add_argument("--task"); lno.add_argument("--session")
+    lno.add_argument("--event", required=True)
+    lno.set_defaults(func=cmd_lifecycle_note)
+    lcn = lcs.add_parser("cancel", help="stop one task now; idempotent")
+    lcn.add_argument("--task", required=True); lcn.add_argument("--reason")
+    lcn.set_defaults(func=cmd_lifecycle_cancel)
+    lrp = lcs.add_parser("resume-plan", help="find the task a 'continue' means; starts nothing")
+    lrp.add_argument("--session"); lrp.add_argument("--project"); lrp.add_argument("--hint")
+    lrp.set_defaults(func=cmd_lifecycle_resume_plan)
+    lre = lcs.add_parser("resume", help="continue a task after the user asks")
+    lre.add_argument("--task", required=True); lre.add_argument("--session")
+    lre.add_argument("--hint"); lre.set_defaults(func=cmd_lifecycle_resume)
+    lrc = lcs.add_parser("recover", help="mark crashed work INTERRUPTED; never resumes it")
+    lrc.add_argument("--reason"); lrc.set_defaults(func=cmd_lifecycle_recover)
+    lpr = lcs.add_parser("prune", help="drop expired records; artifacts are never touched")
+    lpr.add_argument("--retention-days", type=int, default=lifecycle.RETENTION_DAYS)
+    lpr.set_defaults(func=cmd_lifecycle_prune)
 
     st = sub.add_parser("selftest"); st.set_defaults(func=cmd_selftest)
     return p

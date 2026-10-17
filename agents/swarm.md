@@ -423,6 +423,119 @@ python -m swarmkit run phase DELIVERED
 
 If it refuses, deliver nothing. Finish the verification, or report honestly that you could not.
 
+## Session-bound tasks — the work that outlives the turn
+
+The pipeline above lives inside one run dir and assumes you are still here to drive it. This
+layer sits *above* it: a **task** is a unit of work bound to the chat session that asked for
+it, so that work cannot keep running — and keep spending — after the user closed the window.
+Open one whenever a request will not finish in this turn (a long render, a migration, a
+multi-hour build), and close it deliberately:
+
+```sh
+python -m swarmkit lifecycle start --session <session-id> --goal "<one sentence>" \
+    --plan '[{"id": "build"}, {"id": "verify"}]'
+```
+
+`--session` is never optional: a task with no owning session could not be stopped when its
+conversation closed, which is the entire reason this layer exists. Global flags come **before**
+the subcommand — `python -m swarmkit --json --workspace . lifecycle status --task t1`.
+
+**Eight states, because a boolean cannot say what happened.** `INTERRUPTED` is distinct from
+`PAUSED` on purpose: the first means *we did not choose to stop* (crash, killed app), the
+second means *somebody deliberately did* — and that is the difference between a routine resume
+and one that re-verifies before trusting a single cached byte.
+
+| State | Means |
+|---|---|
+| `RUNNING` | owned by a live session; executing now |
+| `CANCELLING` | stop was asked for, children not all dead yet — a state you can observe and wait on |
+| `PAUSED` | stopped on purpose, completed steps and artifacts intact; resumable |
+| `INTERRUPTED` | cut off without anyone choosing to stop it; resumable, but re-verify first |
+| `RESUMING` | handed to a new attempt; the previous epoch is fenced out |
+| `BLOCKED` | waiting on something outside the work |
+| `FAILED` | the attempt failed; resumable, retries recorded |
+| `COMPLETED` | every planned step done and no child running. Terminal: nothing leaves it |
+
+**Closing one session is not closing the application.** Two OpenCode sessions can be mid-task in
+one project, so a closed chat stops only what that chat owned and leaves every other session's
+tasks alone. The application going away is a different moment, and a different command:
+
+```sh
+python -m swarmkit lifecycle session-close --session <session-id> --reason "user closed the chat"
+python -m swarmkit lifecycle shutdown --reason "application shutdown"
+```
+
+**Checkpoints are atomic *and* journalled.** Each one writes `task.json` through a temp file →
+fsync → rename, then appends the same state to `checkpoints.jsonl` with a monotonic sequence. A
+crash *between* the two would leave the record behind the journal, so recovery replays every
+journal entry newer than the record's own sequence — the journal is the authority on what was
+last confirmed. Call it at every real milestone, and pass the task epoch `lifecycle status`
+reports so a write from a superseded attempt is refused rather than recorded:
+
+```sh
+python -m swarmkit lifecycle checkpoint --task <task-id> --step <step-id> --epoch <epoch> \
+    --artifact <path> --result "<what the step produced>"
+python -m swarmkit lifecycle status --task <task-id>      # steps done, out of total — real numbers only
+python -m swarmkit lifecycle list                          # every task on record
+```
+
+Progress is counted from the plan and the completed set, never from an event count, so it cannot
+claim work that did not happen.
+
+**Cancellation stops work and deletes nothing.** `lifecycle cancel --task <task-id>` requests
+the stop, checkpoints *before* signalling, then terminates the children that task owns — politely
+first, forcibly after 5s — and leaves the record, the journal, the completed steps and every
+artifact exactly where they are. It is idempotent, because a session event, a shutdown hook and
+the user can all ask for the same stop at once:
+
+```sh
+python -m swarmkit lifecycle cancel --task <task-id> --reason "user asked to stop"
+```
+
+**Recovery marks, it never resumes.** `lifecycle recover --reason "plugin startup"` looks for
+records still claiming to be live whose owner process is gone, marks them `INTERRUPTED`, and
+stops there. Reopening the application is not the user asking to continue, and a recovery
+routine that helpfully restarts everything it finds is worse than one that does nothing —
+because nobody asked.
+
+**Resume happens on one condition: the user asked.** `lifecycle resume-plan` finds the task a
+"continue" probably means and returns a brief; it starts nothing. If more than one candidate
+matches it reports `ambiguous` and you ask ONE question naming them. Only `lifecycle resume`
+actually restarts work, and it rotates the epoch first:
+
+```sh
+python -m swarmkit lifecycle resume-plan --session <session-id> --hint "finish the migration"
+python -m swarmkit lifecycle resume --task <task-id> --session <session-id>
+```
+
+**A stale worker cannot write its way back in.** Both cancel and resume mint a new epoch, so a
+worker still running from the previous attempt that finally reports a result is refused with
+`EPOCH_MISMATCH`. Without that fence the cancelled work would resurrect itself through its own
+late write.
+
+**Completion is earned, never declared.** A task with steps outstanding cannot be moved to
+`COMPLETED` (`INCOMPLETE`), one with a running child cannot either, and `CANCELLING` has no
+edge to `COMPLETED` at all — so a partially executed task can never be reported as done.
+
+Records past the retention window are dropped by `lifecycle prune --retention-days N` and by
+nothing else. Artifact files are never touched: pruning removes bookkeeping, not work.
+
+**From inside the session, the plugin exposes the same engine as a tool** (`swarm_lifecycle`,
+in the `swarm` namespace) — use it instead of shelling out when you are already in a turn:
+
+```
+swarm_lifecycle action=status session=<session-id>
+swarm_lifecycle action=start session=<session-id> goal="<one sentence>"
+swarm_lifecycle action=checkpoint task=<task-id> step=<step-id> epoch=<epoch> artifact=<path>
+swarm_lifecycle action=resume task=<task-id>
+swarm_lifecycle action=cancel task=<task-id> reason="<why>"
+swarm_lifecycle action=list
+```
+
+`session-close`, `shutdown`, `recover`, `note` and `resume-plan` are deliberately not in that
+list: they are host-driven, and an agent that could fire them could cancel another session's
+work or force a resume the user never asked for.
+
 ## Skills carry the domain brains
 
 ~130 skills exist. Agents are role contracts; skills are domain experts. When a workstream matches a skill's description, ORDER the owning agent in its contract to load that skill (implement, tdd, code-review, lookdev, materials, lighting, rendering, rigging, animation, unity-export, reverse-engineer-anything, etc.). Load skills yourself when your own step matches (e.g. compositing at delivery).

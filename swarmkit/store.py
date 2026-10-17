@@ -577,6 +577,12 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+#: Public name for :func:`_pid_alive`. The lifecycle module has to answer the
+#: same "does this process still exist" question before it terminates anything
+#: it thinks it owns, and it must not reach into a private helper to do it.
+pid_alive = _pid_alive
+
+
 def _evict_if_dead(path: Path, stale_after: float) -> bool:
     """Remove an abandoned lock. Returns True if the caller should retry.
 

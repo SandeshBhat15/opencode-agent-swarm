@@ -259,6 +259,37 @@ class TestAgentPagesReachEveryCommandTheyNeed(unittest.TestCase):
         "evolve scope-check": ["agents/swarm.md"],
     }
 
+    # The session-bound task lifecycle. The same defect one mechanism later:
+    # `lifecycle start` / `checkpoint` / `cancel` / `resume` enforce ownership,
+    # fencing and durable progress, and an orchestrator that no page ever names
+    # will leave work running after its session closes. Matched on the exact
+    # fragment, so the page has to name the subcommand as the CLI spells it.
+    LIFECYCLE = {
+        "lifecycle start": ["agents/swarm.md"],
+        "lifecycle checkpoint": ["agents/swarm.md"],
+        "lifecycle status": ["agents/swarm.md"],
+        "lifecycle cancel": ["agents/swarm.md"],
+        "lifecycle resume": ["agents/swarm.md"],
+        "lifecycle resume-plan": ["agents/swarm.md"],
+        "lifecycle session-close": ["agents/swarm.md"],
+        "lifecycle shutdown": ["agents/swarm.md"],
+        "lifecycle recover": ["agents/swarm.md"],
+    }
+
+    # The plugin's in-session control surface, which is how the orchestrator
+    # reaches the same engine from inside a session rather than from a shell.
+    # Keys are the `key=value` forms of the tool's own input schema; the plugin
+    # forwards only the flags each action accepts, so a page that invents a flag
+    # here documents a call that cannot happen.
+    LIFECYCLE_TOOL = {
+        "action=start": ["agents/swarm.md"],
+        "action=checkpoint": ["agents/swarm.md"],
+        "action=status": ["agents/swarm.md"],
+        "action=cancel": ["agents/swarm.md"],
+        "action=resume": ["agents/swarm.md"],
+        "action=list": ["agents/swarm.md"],
+    }
+
     # Every spawned worker needs to know how to keep its lease alive.
     WORKERS_NEEDING_LIVENESS = [
         "agents/swarm/builder.md",
@@ -314,6 +345,27 @@ class TestAgentPagesReachEveryCommandTheyNeed(unittest.TestCase):
             for page in pages:
                 with self.subTest(command=command, page=page):
                     self.assertIn(command, self._body(page))
+
+    def test_the_lifecycle_commands_are_documented_where_an_agent_reads(self) -> None:
+        for command, pages in self.LIFECYCLE.items():
+            for page in pages:
+                with self.subTest(command=command, page=page):
+                    self.assertIn(
+                        command, self._body(page),
+                        f"{page} never mentions `{command}`; task ownership, "
+                        "durable checkpoints and fencing are unreachable unless "
+                        "the orchestrator is told the command exists",
+                    )
+
+    def test_the_lifecycle_tool_actions_are_documented_where_an_agent_reads(self) -> None:
+        for command, pages in self.LIFECYCLE_TOOL.items():
+            for page in pages:
+                with self.subTest(command=command, page=page):
+                    self.assertIn(
+                        command, self._body(page),
+                        f"{page} never shows `{command}`; an action the plugin "
+                        "exposes but no page names is an action nobody calls",
+                    )
 
     def test_the_lifecycle_names_all_nine_stages_on_the_orchestrator_page(self) -> None:
         body = self._body("agents/swarm.md")
