@@ -19,6 +19,7 @@ from . import (analysis, contracts, evolve, experience, gate, isolator,
                lessons, lifecycle, manager, phases, store, workers)
 from .budget import Budget, Limits
 from .errors import SwarmError
+from . import context, decision, delegation, knowledge, router, telemetry
 
 DEFAULT_LESSONS = Path.home() / ".config" / "opencode" / "swarm-lessons.md"
 
@@ -1122,6 +1123,411 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return _emit({"selftest": "ok"}, args.json, "selftest ok")
 
 
+# --- routing, context, delegation, knowledge, telemetry ---------------------
+#
+# Five engines that were implemented, tested and then left unreachable: no
+# subcommand, no re-export. That is the exact failure this package keeps
+# guarding against - a mechanism that works and nobody can call is not a
+# mechanism. Each command is a thin translation from argv to the module's own
+# public function so the behaviour lives in one place and the CLI only frames
+# it. Nothing below invents a rule the module did not state.
+
+_CHECKPOINT_MAX_TOKENS = 2000
+_USAGE_FIELDS = frozenset(telemetry.Usage.__dataclass_fields__)
+
+
+def _registry_root(workspace: Path) -> Path:
+    """Where a run's model catalog, outcomes and router budget live.
+
+    Workspace-scoped like ``_memory_root``/``_evolve_root``: one project's
+    recorded outcomes must not steer another project's routing.
+    """
+    return workspace / router.DEFAULT_REGISTRY
+
+
+def _knowledge_root(workspace: Path) -> Path:
+    return workspace / knowledge.DEFAULT_ROOT
+
+
+def _read_text(path: str | Path) -> str:
+    target = Path(path)
+    if not target.is_file():
+        raise SwarmError(f"no such file: {target}", code="BAD_USAGE")
+    return target.read_text(encoding="utf-8")
+
+
+def _read_bytes(path: str | Path) -> bytes:
+    target = Path(path)
+    if not target.is_file():
+        raise SwarmError(f"no such file: {target}", code="BAD_USAGE")
+    return target.read_bytes()
+
+
+def _flat(values: Any) -> list[str]:
+    """Flatten ``--flag a b``/``--flag a --flag b`` into a single list."""
+    out: list[str] = []
+    for item in values or ():
+        if isinstance(item, (list, tuple)):
+            out.extend(str(value) for value in item)
+        else:
+            out.append(str(item))
+    return out
+
+
+# -- model: routing over a recorded catalog ----------------------------------
+
+
+def cmd_model_import(args: argparse.Namespace) -> int:
+    registry = _registry_root(Path(args.workspace).resolve())
+    result = router.import_catalog(args.file, args.source, registry=registry)
+    return _emit(result, args.json,
+                 f"imported {result['count']} model(s) from {result['source']}")
+
+
+def cmd_model_route(args: argparse.Namespace) -> int:
+    registry = _registry_root(Path(args.workspace).resolve())
+    decision = router.route(
+        args.category,
+        registry=registry,
+        pin=args.pin,
+        budget_remaining=args.budget_remaining,
+        accept_unknown_price=args.accept_unknown_price,
+    )
+    payload = {
+        "task": args.task,
+        "objective": args.objective,
+        "role": args.role,
+        "allow": args.allow,
+        "request": {
+            "category": args.category,
+            "pin": args.pin,
+            "budget_remaining": args.budget_remaining,
+            "accept_unknown_price": bool(args.accept_unknown_price),
+        },
+        **decision.to_dict(),
+    }
+    return _emit(payload, args.json, f"{decision.status}: {decision.reason}")
+
+
+def cmd_model_next(args: argparse.Namespace) -> int:
+    registry = _registry_root(Path(args.workspace).resolve())
+    cause = args.cause
+    if cause is None:
+        cause = router.diagnose(args.error) if args.error else "unknown"
+    result = router.next(
+        cause,
+        tried=args.tried or (),
+        registry=registry,
+        escalations_used=args.model_failures,
+        pin=args.pin,
+        retries=args.retries,
+    )
+    payload = {
+        "task": args.task,
+        "error": args.error,
+        "cause": cause,
+        "tried": list(args.tried or ()),
+        "request": {
+            "retries": args.retries,
+            "model_failures": args.model_failures,
+            "pin": args.pin,
+        },
+        **result,
+    }
+    return _emit(payload, args.json, f"{result['status']}: {result['reason']}")
+
+
+def cmd_model_diagnose(args: argparse.Namespace) -> int:
+    cause = router.diagnose(args.error, args.retries)
+    payload = {"error": args.error, "cause": cause, "retries": args.retries}
+    return _emit(payload, args.json, f"cause: {cause}")
+
+
+def cmd_model_record(args: argparse.Namespace) -> int:
+    registry = _registry_root(Path(args.workspace).resolve())
+    item = router.record(
+        args.provider, args.model, args.category, args.outcome,
+        retries=args.retries, qc_rejected=args.qc_rejected, cause=args.cause,
+        registry=registry,
+    )
+    return _emit(item, args.json,
+                 f"recorded {item['key']} {item['outcome']} for {item['category']}"
+                 f" (evidence={item['evidence']})")
+
+
+def cmd_model_history(args: argparse.Namespace) -> int:
+    registry = _registry_root(Path(args.workspace).resolve())
+    rows = router.history(args.category, registry=registry)
+    lines = [
+        f"{row['key']}  {row['verdict']:<8} verified={row['verified']}"
+        f"/{row['attempts']} (need {router.MIN_COMPARABLE_ATTEMPTS})"
+        for row in rows
+    ] or ["(no recorded outcomes)"]
+    return _emit({"category": args.category, "history": rows,
+                  "min_comparable_attempts": router.MIN_COMPARABLE_ATTEMPTS},
+                 args.json, "\n".join(lines))
+
+
+def cmd_model_budget(args: argparse.Namespace) -> int:
+    registry = _registry_root(Path(args.workspace).resolve())
+    state = router.budget(max_cost=args.max_cost, max_tokens=args.max_tokens,
+                          registry=registry)
+    lines = [
+        f"max_cost: {state['max_cost']}",
+        f"spent_cost: {state['spent_cost']}",
+        f"remaining_cost: {state['remaining_cost']}",
+        f"max_tokens: {state['max_tokens']}",
+        f"spent_tokens: {state['spent_tokens']}",
+        f"remaining_tokens: {state['remaining_tokens']}",
+    ]
+    return _emit(state, args.json, "\n".join(lines))
+
+
+# -- context: the minimal packet, the checkpoint, the ceiling ----------------
+
+
+def cmd_context_packet(args: argparse.Namespace) -> int:
+    instructions: list[str] = []
+    if args.instructions:
+        instructions = [line.strip() for line in _read_text(args.instructions).splitlines()
+                        if line.strip()]
+    packet = context.build_packet(
+        args.objective,
+        task_id=args.task,
+        criteria=_flat(args.criteria),
+        dependencies=_flat(args.dep),
+        instructions=instructions,
+        files=_flat(args.file),
+    )
+    payload = packet.to_dict()
+    payload["sections"] = context.sections_from_packet(packet)
+    payload["estimated_tokens"] = packet.estimated_tokens()
+    return _emit(payload, args.json, packet.render())
+
+
+def cmd_context_summarise(args: argparse.Namespace) -> int:
+    try:
+        sections = json.loads(_read_text(args.file))
+    except json.JSONDecodeError as exc:
+        raise SwarmError(
+            f"{args.file} is not a JSON object of sections: {exc}", code="BAD_USAGE"
+        ) from exc
+    checkpoint = context.summarise(sections, args.max_tokens)
+    return _emit(checkpoint.to_dict(), args.json, checkpoint.render())
+
+
+def cmd_context_fits(args: argparse.Namespace) -> int:
+    result = context.fits(args.limit, _read_text(args.file),
+                          label=Path(args.file).name)
+    payload = {
+        "tokens": result.tokens,
+        "limit": result.limit,
+        "reserved": result.reserved,
+        "label": result.label,
+        "headroom": result.headroom(),
+        "ok": result.ok,
+        "method": context.TOKEN_ESTIMATE_METHOD,
+    }
+    return _emit(payload, args.json, result.render())
+
+
+# -- delegate: run it here, or hand it off; repair or stop -------------------
+
+
+def cmd_delegate_decide(args: argparse.Namespace) -> int:
+    workstreams = 1
+    if args.files and args.files > 1:
+        workstreams = int(args.files)
+    if args.independent:
+        workstreams = max(workstreams, 2)
+    signals = delegation.DelegationSignals(
+        specialist_capability=bool(args.specialist),
+        independent_workstreams=workstreams,
+        risk_reduction=bool(args.risk and args.risk != "low"),
+        lane=args.lane or "",
+    )
+    decision = delegation.decide(signals, depth=args.depth)
+    payload = {
+        "objective": args.objective,
+        "specialist": args.specialist,
+        "signals": signals.to_dict(),
+        "decision": decision.to_dict(),
+    }
+    verdict = "DELEGATE" if decision.delegate else "DIRECT"
+    return _emit(payload, args.json,
+                 f"{verdict} [{decision.code}]: {decision.reason}")
+
+
+def cmd_delegate_retry(args: argparse.Namespace) -> int:
+    decision = delegation.retry_decision(args.attempt, args.limit, args.cause or "")
+    verdict = "RETRY" if decision.retry else "STOP"
+    return _emit(decision.to_dict(), args.json,
+                 f"{verdict} [{decision.code}]: {decision.reason}")
+
+
+# -- knowledge: the deduplicating doc cache ----------------------------------
+
+
+def cmd_knowledge_cache(args: argparse.Namespace) -> int:
+    store = knowledge.Knowledge(_knowledge_root(Path(args.workspace).resolve()))
+    content = _read_text(args.content_file) if args.content_file else ""
+    ttl = None if args.ttl_hours is None else float(args.ttl_hours) * 3600.0
+    result = store.cache_doc(args.url, content, ttl=ttl)
+    payload = {name: value for name, value in result.items() if name != "doc"}
+    payload["doc"] = result["doc"].to_dict() if result.get("doc") else None
+    return _emit(payload, args.json, f"{result['reason']}: {result['url']}")
+
+
+def cmd_knowledge_lookup(args: argparse.Namespace) -> int:
+    store = knowledge.Knowledge(_knowledge_root(Path(args.workspace).resolve()))
+    result = store.lookup(args.url)
+    payload = dict(result)
+    doc = payload.get("doc")
+    payload["doc"] = doc.to_dict() if doc is not None else None
+    if result["hit"]:
+        human = (f"hit ({result['matched_on']}, score {result['score']}): "
+                 f"{result['url']} stale={result['stale']}")
+    else:
+        human = f"no cached answer for {args.url}"
+    return _emit(payload, args.json, human)
+
+
+def cmd_knowledge_freshness(args: argparse.Namespace) -> int:
+    store = knowledge.Knowledge(_knowledge_root(Path(args.workspace).resolve()))
+    if args.url:
+        # ``is_stale`` refuses a URL that was never cached, so a miss is an
+        # error the caller can branch on rather than a silent "fresh".
+        stale = store.is_stale(args.url)
+        payload = {
+            "url": knowledge.normalise_url(args.url),
+            "stale": stale,
+            "freshness": store.lookup(args.url).get("freshness"),
+        }
+        human = f"{payload['url']}: {'STALE' if stale else 'fresh'}"
+    else:
+        payload = store.freshness()
+        human = (f"{payload['fresh']} fresh, {payload['stale']} stale "
+                 f"of {payload['total']} doc(s)")
+    return _emit(payload, args.json, human)
+
+
+# -- telemetry: what a run actually consumed ---------------------------------
+
+
+def _sessions(payload: Any) -> list[Any]:
+    """``telemetry.load_sessions`` with its ``ValueError`` surfaced as a SwarmError.
+
+    ``TelemetryError`` subclasses ``ValueError``, which the CLI's error handler
+    does not catch, so a malformed payload would escape as a traceback instead of
+    a refusal a caller can branch on.
+    """
+    try:
+        return telemetry.load_sessions(payload)
+    except telemetry.TelemetryError as exc:
+        raise SwarmError(str(exc), code=exc.code) from exc
+
+
+def _measurement(path: str | Path) -> telemetry.Usage:
+    """Read one measurement from a usage JSON, a baseline row, a session list or a run log.
+
+    The formats a caller already has are accepted directly, so recording a
+    baseline does not force the measurement to be reshaped first.
+    """
+    text = _read_text(path)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        inner = payload.get("usage")
+        if isinstance(inner, dict):
+            return telemetry.Usage(**{k: v for k, v in inner.items() if k in _USAGE_FIELDS})
+        if any(name in payload for name in telemetry.MEASURED_FIELDS):
+            return telemetry.Usage(**{k: v for k, v in payload.items() if k in _USAGE_FIELDS})
+    if isinstance(payload, list):
+        rows = _sessions(payload)
+        return telemetry.combine((telemetry.from_session_record(row) for row in rows),
+                                 label=str(path))
+    return telemetry.parse_run_log(text).usage
+
+
+def cmd_telemetry_sessions(args: argparse.Namespace) -> int:
+    raw = _read_text(args.file) if args.file else sys.stdin.read()
+    sessions = _sessions(raw)
+    priced = telemetry.pricing_available(sessions)
+    payload: dict[str, Any] = {"sessions": len(sessions), "pricing_available": priced}
+    if args.rollup:
+        rolled = telemetry.rollup(sessions)
+        payload["rollup"] = {sid: usage.as_dict() for sid, usage in rolled.items()}
+        lines = [
+            f"{sid}  {usage.label or '(untitled)'}  tokens={usage.total_tokens}"
+            f"  delegations={usage.delegations}"
+            for sid, usage in rolled.items()
+        ]
+        human = "\n".join(lines) or "(no sessions)"
+    else:
+        usages = [telemetry.from_session_record(row) for row in sessions]
+        payload["usage"] = [usage.as_dict() for usage in usages]
+        human = "\n".join(telemetry.render(usage) for usage in usages) or "(no sessions)"
+    if not priced:
+        payload["note"] = "cost not measurable on this host"
+    return _emit(payload, args.json, human)
+
+
+def cmd_telemetry_run_log(args: argparse.Namespace) -> int:
+    parsed = telemetry.parse_run_log(_read_bytes(args.file))
+    payload = {
+        "file": args.file,
+        "malformed_lines": parsed.malformed_lines,
+        "step_count": len(parsed.steps),
+        "usage": parsed.usage.as_dict(),
+        "steps": parsed.steps,
+    }
+    return _emit(payload, args.json, telemetry.render(parsed.usage))
+
+
+def cmd_telemetry_compare(args: argparse.Namespace) -> int:
+    before = _measurement(args.before)
+    after = _measurement(args.after)
+    comparison = telemetry.compare(before, after, category=args.category,
+                                   tolerance=args.tolerance)
+    payload = {
+        "category": comparison.category,
+        "verdict": comparison.verdict,
+        "reason": comparison.reason,
+        "metrics": comparison.metrics,
+        "regressions": comparison.regressions,
+        "improvements": comparison.improvements,
+        "not_measured": comparison.not_measured,
+    }
+    return _emit(payload, args.json, comparison.render())
+
+
+def cmd_telemetry_baseline(args: argparse.Namespace) -> int:
+    target = Path(args.file)
+    if args.task_log:
+        usage = _measurement(args.task_log)
+        written = telemetry.write_baseline(target, args.category, usage)
+        payload = {
+            "recorded": True,
+            "file": str(written),
+            "category": args.category,
+            "usage": usage.as_dict(),
+        }
+        return _emit(payload, args.json,
+                     f"baseline recorded for {args.category} in {written}")
+    rows = telemetry.load_baselines(target, args.category)
+    payload = {
+        "recorded": False,
+        "file": str(target),
+        "category": args.category,
+        "baselines": rows,
+        "count": len(rows),
+    }
+    return _emit(payload, args.json,
+                 f"{len(rows)} baseline(s) recorded for {args.category}")
+
+
 # -- parser --------------------------------------------------------------
 
 
@@ -1381,6 +1787,128 @@ def build_parser() -> argparse.ArgumentParser:
     lpr.set_defaults(func=cmd_lifecycle_prune)
 
     st = sub.add_parser("selftest"); st.set_defaults(func=cmd_selftest)
+
+    # -- routing, context, delegation, knowledge, telemetry --------------
+    md = sub.add_parser("model", help="route work to a model from a recorded catalog")
+    mds = md.add_subparsers(dest="cmd", required=True)
+    mi = mds.add_parser("import", help="import a host model catalog")
+    mi.add_argument("--file", required=True); mi.add_argument("--source", default="host")
+    mi.set_defaults(func=cmd_model_import)
+    mr = mds.add_parser("route", help="choose a model for a category, or refuse with a reason")
+    mr.add_argument("--task", required=True); mr.add_argument("--objective", required=True)
+    mr.add_argument("--role", required=True)
+    mr.add_argument("--category", default="general", choices=list(router.CATEGORIES))
+    mr.add_argument("--pin"); mr.add_argument("--allow")
+    mr.add_argument("--budget-remaining", dest="budget_remaining", type=float)
+    mr.add_argument("--accept-unknown-price", dest="accept_unknown_price", action="store_true")
+    mr.set_defaults(func=cmd_model_route)
+    mn = mds.add_parser("next", help="the next move after a failure, escalating only when warranted")
+    mn.add_argument("--task", required=True); mn.add_argument("--error")
+    mn.add_argument("--cause")
+    # `--attempt` is the documented spelling of "attempts so far"; `--retries`
+    # stays as the module-level name for the same count.
+    mn.add_argument("--retries", "--attempt", dest="retries", type=int, default=0)
+    mn.add_argument("--model-failures", dest="model_failures", type=int, default=0)
+    mn.add_argument("--tried", action="append"); mn.add_argument("--pin")
+    mn.set_defaults(func=cmd_model_next)
+    mdg = mds.add_parser("diagnose", help="attribute an error to one cause")
+    mdg.add_argument("--error", required=True); mdg.add_argument("--retries", type=int, default=0)
+    mdg.set_defaults(func=cmd_model_diagnose)
+    mrec = mds.add_parser("record", help="append one routing outcome")
+    mrec.add_argument("--provider", required=True); mrec.add_argument("--model", required=True)
+    mrec.add_argument("--category", required=True, choices=list(router.CATEGORIES))
+    mrec.add_argument("--outcome", required=True, choices=list(router.OUTCOMES))
+    mrec.add_argument("--cause"); mrec.add_argument("--retries", type=int, default=0)
+    mrec.add_argument("--qc-rejected", dest="qc_rejected", action="store_true")
+    mrec.set_defaults(func=cmd_model_record)
+    mh = mds.add_parser("history", help="what the router believes, with the evidence")
+    mh.add_argument("--category", required=True, choices=list(router.CATEGORIES))
+    mh.set_defaults(func=cmd_model_history)
+    mb = mds.add_parser("budget", help="spent vs the router's cost and token ceilings")
+    mb.add_argument("--max-cost", dest="max_cost", type=float)
+    mb.add_argument("--max-tokens", dest="max_tokens", type=int)
+    mb.set_defaults(func=cmd_model_budget)
+
+    cx = sub.add_parser("context", help="build minimal worker context, summarise, size-check")
+    cxs = cx.add_subparsers(dest="cmd", required=True)
+    cxp = cxs.add_parser("packet", help="the minimal context packet for one worker")
+    cxp.add_argument("--task", required=True); cxp.add_argument("--objective", required=True)
+    cxp.add_argument("--criteria", action="append", nargs="+", required=True)
+    cxp.add_argument("--dep", action="append"); cxp.add_argument("--file", action="append")
+    cxp.add_argument("--instructions")
+    cxp.set_defaults(func=cmd_context_packet)
+    cxsx = cxs.add_parser("summarise", help="compress completed phases into a checkpoint")
+    cxsx.add_argument("--file", required=True)
+    cxsx.add_argument("--max-tokens", dest="max_tokens", type=int, default=_CHECKPOINT_MAX_TOKENS)
+    cxsx.set_defaults(func=cmd_context_summarise)
+    cxf = cxs.add_parser("fits", help="check a payload against a context ceiling")
+    cxf.add_argument("--file", required=True); cxf.add_argument("--limit", type=int, required=True)
+    cxf.set_defaults(func=cmd_context_fits)
+
+    dg = sub.add_parser("delegate", help="delegate-or-not, and repair-or-stop, with reasons")
+    dgs = dg.add_subparsers(dest="cmd", required=True)
+    dd = dgs.add_parser("decide", help="run it here, or hand it off")
+    dd.add_argument("--objective", required=True)
+    dd.add_argument("--lane", choices=list(manager.TRIAGE_LANES))
+    dd.add_argument("--files", type=int); dd.add_argument("--independent", action="store_true")
+    dd.add_argument("--specialist"); dd.add_argument("--risk", choices=["low", "med", "high"])
+    dd.add_argument("--depth", type=int, default=0)
+    dd.set_defaults(func=cmd_delegate_decide)
+    dr = dgs.add_parser("retry", help="a targeted repair, or a stop")
+    dr.add_argument("--attempt", type=int, required=True); dr.add_argument("--limit", type=int)
+    dr.add_argument("--cause")
+    dr.set_defaults(func=cmd_delegate_retry)
+
+    kn = sub.add_parser("knowledge", help="deduplicating doc cache with reported freshness")
+    kns = kn.add_subparsers(dest="cmd", required=True)
+    kc = kns.add_parser("cache", help="store a fetched page under its normalised URL")
+    kc.add_argument("--url", required=True); kc.add_argument("--content-file")
+    kc.add_argument("--ttl-hours", dest="ttl_hours", type=float)
+    kc.set_defaults(func=cmd_knowledge_cache)
+    kl = kns.add_parser("lookup", help="the cached answer for a URL or a phrase")
+    kl.add_argument("--url", required=True); kl.set_defaults(func=cmd_knowledge_lookup)
+    kf = kns.add_parser("freshness", help="whether cached docs are past their TTL")
+    kf.add_argument("--url"); kf.set_defaults(func=cmd_knowledge_freshness)
+
+    tl = sub.add_parser("telemetry", help="measured usage, baselines and comparison")
+    tls = tl.add_subparsers(dest="cmd", required=True)
+    tse = tls.add_parser("sessions", help="usage from session records (file or stdin)")
+    tse.add_argument("--file"); tse.add_argument("--rollup", action="store_true")
+    tse.set_defaults(func=cmd_telemetry_sessions)
+    trl = tls.add_parser("run-log", help="per-step usage from an opencode run log")
+    trl.add_argument("--file", required=True); trl.set_defaults(func=cmd_telemetry_run_log)
+    tc = tls.add_parser("compare", help="judge an after measurement against a before")
+    tc.add_argument("--before", required=True); tc.add_argument("--after", required=True)
+    tc.add_argument("--category", default="task"); tc.add_argument("--tolerance", type=float, default=0.10)
+    tc.set_defaults(func=cmd_telemetry_compare)
+    tb = tls.add_parser("baseline", help="record or list a category's baseline")
+    tb.add_argument("--file", required=True); tb.add_argument("--category", required=True)
+    tb.add_argument("--task-log", dest="task_log")
+    tb.set_defaults(func=cmd_telemetry_baseline)
+
+    dc = sub.add_parser("decide", help="one deterministic decision for a task (no LLM)")
+    dcs = dc.add_subparsers(dest="cmd", required=True)
+    dcc = dcs.add_parser("classify", help="classify a request along five dimensions")
+    dcc.add_argument("--request", required=True)
+    dcc.add_argument("--files", type=int); dcc.add_argument("--independent", type=int)
+    dcc.set_defaults(func=cmd_decide_classify)
+    dcd = dcs.add_parser("decide", help="the full decision (workflow, delegation, model, retry)")
+    dcd.add_argument("--request", required=True)
+    dcd.add_argument("--files", type=int); dcd.add_argument("--independent", type=int)
+    dcd.add_argument("--registry"); dcd.add_argument("--enabled", action="store_true")
+    dcd.set_defaults(func=cmd_decide_decide)
+    # `--json` is a top-level flag, so it is only read before the subcommand.
+    # These leaf parsers offer it after the subcommand too, which is the shape
+    # the agent pages call them in; the dest is shared, so `swarmkit --json X`
+    # keeps working unchanged.
+    for leaf in (mi, mr, mn, mdg, mrec, mh, mb, cxp, cxsx, cxf,
+                 dd, dr, kc, kl, kf, tse, trl, tc, tb, dcc, dcd):
+        # SUPPRESS, not False: a leaf default of False would overwrite a
+        # top-level `--json` (subparsers parse into a fresh namespace whose
+        # every attribute is copied back), silently turning JSON off.
+        leaf.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                          help="emit JSON")
+
     return p
 
 
@@ -1666,6 +2194,28 @@ def cmd_evolve_scope_check(args: argparse.Namespace) -> int:
     return _emit({"allowed": allowed, "protected": sorted(evolve.PROTECTED_PATHS)},
                  args.json,
                  f"scope ok: {allowed}" if allowed else "scope refused")
+
+
+# -- decide: one deterministic decision for a task -----------------------------
+
+
+def cmd_decide_classify(args: argparse.Namespace) -> int:
+    profile = decision.classify(args.request, file_count=args.files or 0,
+                             independent_workstreams=args.independent or 1)
+    d = decision.decide(args.request, enabled=False, file_count=args.files or 0,
+                        independent_workstreams=args.independent or 1)
+    return _emit(profile.to_dict(), args.json, decision.render(d))
+
+
+def cmd_decide_decide(args: argparse.Namespace) -> int:
+    result = decision.decide(
+        args.request,
+        enabled=bool(args.enabled) or decision.is_enabled(),
+        file_count=args.files or 0,
+        independent_workstreams=args.independent or 1,
+        registry=Path(args.registry) if args.registry else None,
+    )
+    return _emit(result.to_dict(), args.json, decision.render(result))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
