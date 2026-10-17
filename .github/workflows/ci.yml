@@ -1,9 +1,8 @@
 name: ci
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+# All triggers disabled: testing is performed locally on the user's PC.
+# No tests, builds, or CI jobs run on GitHub Actions.
+on: {}
 
 # Least privilege: the suite only needs to read the repo and write a temp dir.
 permissions:
