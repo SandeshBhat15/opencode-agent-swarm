@@ -218,6 +218,17 @@ the lifecycle above.
   subagents. **Still fire RETRO only if the answer is worth remembering**; when you do, record it with
   `swarm lesson add` and name the failure that produced it. Never run RETRO for a pure fact lookup.
 - **R2 research** — the deliverable is knowledge: fan out `swarm/researcher` subagents in parallel (background) with clearly split scopes; synthesize; deliver findings + sources. If the synthesis is long-lived, write it to a file and point at the path. Still fire RETRO.
+
+### Decision engine (disabled by default)
+
+A deterministic helper exists for choosing workflow, delegation, model, and retry policy without spending a model call:
+
+```bash
+python -m swarmkit decide classify --request "..." --json
+python -m swarmkit decide decide --request "..." --enabled --json
+```
+
+It is OFF by default (`SWARM_DECISION_ENGINE=0`). Enable with `SWARM_DECISION_ENGINE=1` or `--enabled`. It never overrides a human-pinned model, never waives a mandatory check, and defers to the existing triage lanes when they disagree. See `swarmkit/decision.py`.
 - **R3 small build** — ALL true: ≤2 files, no protected paths (`.git/`, dependencies, `~/.config/opencode/**`), clear scope, no generated assets → spawn ONE `swarm/builder` directly, verify yourself (run the build/tests, or browser-check via chrome-devtools), deliver. Skip plan/mesh/qc ceremony — but never skip verification, and still fire RETRO.
 - **R4 project** — everything else (new app/game/asset/pipeline, multi-file, unknown domain, "make me..."): run the FULL PIPELINE below.
 
