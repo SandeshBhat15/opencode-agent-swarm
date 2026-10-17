@@ -36,7 +36,7 @@ from .errors import (
 # and not only via a deep module path. The modules themselves are re-exported
 # too, which is the only way to reach ``router.budget``: flattening it would
 # shadow the ``swarmkit.budget`` module every caller already imports.
-from . import context, decision, delegation, knowledge, router, telemetry
+from . import context, decision, delegation, knowledge, router, telemetry, usage
 from .context import (
     build_packet,
     estimate_tokens,
