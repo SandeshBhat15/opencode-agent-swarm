@@ -1,7 +1,0 @@
-{
-  "name": "opencode-swarm-lifecycle",
-  "private": true,
-  "version": "1.0.0",
-  "type": "module",
-  "description": "Session-bound lifecycle plugin for the OpenCode Agent Swarm. No dependencies."
-}

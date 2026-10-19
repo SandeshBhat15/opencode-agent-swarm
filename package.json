@@ -1,0 +1,40 @@
+{
+  "name": "opencode-swarm",
+  "version": "2.0.0",
+  "description": "Autonomous manager-led agent swarm for OpenCode V2: plans, delegates, verifies and delivers, with a deterministic decision engine, capability-based model routing, bounded budgets, persistent learning and gated self-improvement.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=20.11"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./engine": "./src/engine.js",
+    "./plugin": "./src/plugin/runtime.js"
+  },
+  "main": "./src/index.js",
+  "files": [
+    "src",
+    "agents",
+    "docs",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "live": "node scripts/live-check.mjs",
+    "install-config": "node scripts/install.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "agent",
+    "swarm",
+    "orchestration",
+    "self-improvement"
+  ],
+  "dependencies": {},
+  "devDependencies": {}
+}

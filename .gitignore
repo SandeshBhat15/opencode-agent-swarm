@@ -1,7 +1,17 @@
-﻿__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-.swarm-trees/
-.opencode/swarm/
+﻿# dependencies (the project itself has none; kept for contributors)
+node_modules/
+
+# logs and local data
+*.log
+npm-debug.log*
+.swarm-data/
+
+# test and coverage output
+coverage/
+.nyc_output/
+
+# editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
