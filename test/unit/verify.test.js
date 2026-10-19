@@ -11,6 +11,7 @@ import { verify, buildVerdictPrompt, parseVerdict } from "../../src/verify/verif
 import { createRouter } from "../../src/route/router.js";
 import { createLearning } from "../../src/memory/learning.js";
 import { createJournal, JOURNAL_KINDS } from "../../src/core/journal.js";
+import { createBudget } from "../../src/core/budget.js";
 import { FAKE_MODELS } from "../support/fake-context.js";
 
 const nonEmpty = { id: "c_deliverable", text: "Deliverable exists", check: { type: "nonEmpty", target: "output" } };
@@ -113,6 +114,27 @@ test("verifier: a failed independent judgement fails the delivery", async () => 
   const result = await verify(plan, { output: "some text" }, { runtime, router, producerModel: "opencode/other" });
   assert.equal(result.passed, false);
   assert.match(result.reason, /no artefact found/);
+});
+
+test("verifier: an exhausted budget refuses the judge call", async () => {
+  const runtime = runtimeReturning('{"passed": true}');
+  const router = createRouter({ models: [FAKE_MODELS[2]], learning: createLearning({}) });
+  const plan = { id: "p", task: "t", criteria: [nonEmpty, verdictCriterion] };
+  const budget = createBudget({ maxTokens: 10 });
+  budget.charge({ tokens: 50 });
+
+  const result = await verify(plan, { output: "work" }, {
+    runtime,
+    router,
+    budget,
+    producerModel: "opencode/producer",
+  });
+
+  assert.equal(result.passed, false);
+  assert.equal(result.independence, "unavailable");
+  assert.match(result.reason, /budget/i);
+  // The judge is a model call like any other: an exhausted budget buys nothing.
+  assert.equal(runtime.calls.length, 0);
 });
 
 test("verdict parsing: JSON preferred, keyword fallback, no false positives", () => {

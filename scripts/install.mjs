@@ -106,15 +106,25 @@ async function removeLegacy(cfg) {
   }
 }
 
+// A legacy entry is an agent *definition*. The same key names are also used for
+// per-agent permission overrides, and those must survive: the old swarm's page
+// names are still the names of the agents this plugin installs.
+function isLegacyAgentDefinition(value) {
+  return Boolean(value) && typeof value === 'object' && typeof value.prompt === 'string';
+}
+
 function stripSwarmAgents(config) {
   const agents = config.agents;
   if (!agents || typeof agents !== 'object') return false;
   let changed = false;
   for (const key of Object.keys(agents)) {
-    if (key === 'swarm' || key.startsWith('swarm/')) {
-      delete agents[key];
-      changed = true;
+    if (key !== 'swarm' && !key.startsWith('swarm/')) continue;
+    if (!isLegacyAgentDefinition(agents[key])) {
+      record('keep', `agents.${key} (configures an agent, not a legacy definition)`);
+      continue;
     }
+    delete agents[key];
+    changed = true;
   }
   if (changed && Object.keys(agents).length === 0) delete config.agents;
   return changed;

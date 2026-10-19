@@ -90,6 +90,25 @@ export async function verify(plan, evidence, {
     });
   }
 
+  // An exhausted budget buys nothing more. The judge is a model call like any
+  // other, so it is refused here too; the criterion fails loudly rather than
+  // being waved through or paid for.
+  if (typeof budget?.check === "function") {
+    const status = budget.check();
+    if (status.ok === false) {
+      journal?.append(JOURNAL_KINDS.VERIFY, { layer: "model", skipped: true, reason: "budget exhausted" });
+      return finalize({
+        passed: false,
+        independence: "unavailable",
+        deterministic,
+        verdict: null,
+        reason: `independent verification skipped: ${status.error?.message ?? "budget exhausted"}`,
+        startedAt,
+        clock,
+      });
+    }
+  }
+
   // Layer 2 — independent model judgement.
   const requirement = {
     ...(router ? {} : {}),
