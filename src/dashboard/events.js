@@ -64,6 +64,30 @@ const MAX_ARRAY = 24;
 const MAX_DEPTH = 3;
 
 /**
+ * A model reaches the engine either as a ref string (`provider/model`) or, from
+ * runtimes whose session reports the model object, as that object. Only the
+ * label is ever shown: left alone, an object stringifies to "[object Object]"
+ * in the UI, which is a lie about which model ran.
+ */
+export function modelLabel(value) {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return null;
+    return text.length > MAX_STRING ? `${text.slice(0, MAX_STRING)}…` : text;
+  }
+  if (!value || typeof value !== "object") return null;
+
+  const provider = typeof value.providerID === "string" && value.providerID ? value.providerID : null;
+  const id =
+    (typeof value.modelID === "string" && value.modelID) ||
+    (typeof value.id === "string" && value.id) ||
+    null;
+  if (id) return provider ? `${provider}/${id}` : id;
+  if (typeof value.canonical === "string" && value.canonical) return modelLabel(value.canonical);
+  return null;
+}
+
+/**
  * Key names are matched case-insensitively and by suffix, because a nested
  * payload can spell the same field `Prompt`, `PROMPT` or `userPrompt`.
  */
@@ -84,6 +108,14 @@ export function sanitizeEvent(data = {}, depth = 0) {
   for (const [key, value] of Object.entries(data)) {
     if (isBlockedKey(key)) continue;
     if (value === null || value === undefined) continue;
+
+    // Normalised here rather than at the renderer, so every consumer of the
+    // wire sees the same short label for the model that actually ran.
+    if (key.toLowerCase() === "model") {
+      const label = modelLabel(value);
+      if (label) out[key] = label;
+      continue;
+    }
 
     if (typeof value === "number") {
       if (Number.isFinite(value)) out[key] = value;

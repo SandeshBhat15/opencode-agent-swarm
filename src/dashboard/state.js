@@ -7,7 +7,7 @@
  * so, and a metric stays `null` until a measurement arrives.
  */
 
-import { AGENTS, EVENT } from "./events.js";
+import { AGENTS, EVENT, modelLabel } from "./events.js";
 
 const ROLE_TO_AGENT = Object.freeze({
   none: "manager",
@@ -105,7 +105,7 @@ export function createDashboardState({ now = () => Date.now(), handoffLimit = HA
       case EVENT.DELEGATE: {
         const agent = agentForRole(event.role);
         if (agents[agent] && agents[agent].state !== "running") startAgent(event.role, event.at ?? now(), event.stepId);
-        if (agents[agent]) agents[agent].model = event.model ?? null;
+        if (agents[agent]) agents[agent].model = modelLabel(event.model);
         counters.modelCalls += 1;
         break;
       }

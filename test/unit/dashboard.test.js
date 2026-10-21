@@ -17,7 +17,7 @@ import { createManager } from "../../src/engine.js";
 import { createMemoryAdapter, createStore } from "../../src/memory/store.js";
 import { createEventBus } from "../../src/dashboard/bus.js";
 import { createDashboardState, agentForRole } from "../../src/dashboard/state.js";
-import { sanitizeEvent } from "../../src/dashboard/events.js";
+import { sanitizeEvent, modelLabel } from "../../src/dashboard/events.js";
 import { createDashboard } from "../../src/dashboard/index.js";
 import { startDashboardServer, tokenMatches, BIND_HOST } from "../../src/dashboard/server.js";
 import { dashboardPage } from "../../src/dashboard/page.js";
@@ -489,3 +489,57 @@ test("a real run's served state contains no prompt text anywhere", async () => {
 function extractToken(url) {
   return new URL(url).searchParams.get("token");
 }
+
+/* ------------------------------------------------- model label (regression) */
+
+test("a model reported as an object becomes its ref, never [object Object]", () => {
+  // A ref string passes through untouched; the object shapes different runtimes
+  // report collapse to the same label; anything else is simply absent.
+  assert.equal(modelLabel("opencode/deepseek-v4.1-flash-free"), "opencode/deepseek-v4.1-flash-free");
+  assert.equal(modelLabel({ providerID: "opencode", id: "x" }), "opencode/x");
+  assert.equal(modelLabel({ providerID: "opencode", modelID: "x" }), "opencode/x");
+  assert.equal(modelLabel({ canonical: "opencode/x" }), "opencode/x");
+  assert.equal(modelLabel({ id: "x" }), "x");
+  assert.equal(modelLabel({}), null);
+  assert.equal(modelLabel(42), null);
+  assert.equal(modelLabel(""), null);
+
+  const state = createDashboardState();
+  state.apply({ type: "step.start", stepId: "research", role: "researcher" });
+  state.apply({ type: "delegate", stepId: "research", role: "researcher", model: { providerID: "opencode", id: "x" } });
+  assert.equal(state.snapshot().agents.researcher.model, "opencode/x");
+
+  assert.deepEqual(sanitizeEvent({ type: "delegate", model: { providerID: "opencode", id: "x" } }), {
+    type: "delegate",
+    model: "opencode/x",
+  });
+});
+
+test("a real run never serves [object Object] for the model", async () => {
+  // The runtime's session reports the model as an object, which is exactly the
+  // shape that used to reach the page verbatim.
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const info = await dashboard.start();
+  const { manager } = managerWith({ onEvent: (event) => dashboard.onEvent(event) });
+  try {
+    await manager.submit("Audit the catalog router and summarise scoring", {
+      workflow: "research_only",
+      sessionID: "ses_parent",
+    });
+
+    const served = await request({ port: info.port, path: `/state?token=${TOKEN}` });
+    assert.equal(served.status, 200);
+    assert.ok(!served.body.includes("[object Object]"), "an object model is normalised before the wire");
+
+    const models = Object.values(JSON.parse(served.body).agents)
+      .map((agent) => agent.model)
+      .filter((model) => model !== null && model !== undefined);
+    assert.ok(models.length > 0, "the runtime did report a model, so this is the path that broke");
+    for (const model of models) {
+      assert.equal(typeof model, "string");
+      assert.ok(model.includes("/"), `expected a provider/model ref, got ${String(model)}`);
+    }
+  } finally {
+    await dashboard.stop();
+  }
+});
