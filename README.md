@@ -78,22 +78,33 @@ docs/          architecture, agents, configuration, dashboard, efficiency, testi
 
 ## Mission control
 
-An optional local dashboard shows the six agents as live nodes, driven only by events the
-engine actually emitted. It is off by default and never slows or blocks plugin startup.
+A local dashboard shows the six agents as live nodes, driven only by events the engine
+actually emitted. It starts with the plugin, opens once in your default browser, and never
+slows or blocks startup: the server comes up off the critical path and the browser launch
+happens in an unref'd `setImmediate`.
+
+Nothing to configure — but either switch turns it off:
 
 ```jsonc
 {
   "plugins": [
     { "package": "file:///C:/path/to/opencode-agent-swarm/src/index.js",
-      "options": { "dashboard": { "enabled": true } } }
+      "options": { "dashboard": { "autoOpen": false } } }   // serve, but do not open a tab
+      // "options": { "dashboard": { "enabled": false } }   // no dashboard at all
   ]
 }
 ```
 
 It binds `127.0.0.1` on an ephemeral port and requires a per-process capability token. The
-exact URL (token included) is reported by `swarm_status` under `dashboard.url` — it is never
-written to disk or logged. See [Dashboard](docs/dashboard.md) for what is shown, what is
-deliberately not shown, and the limits of the security model.
+browser is launched with a single-use launch ticket rather than the token, so the token never
+reaches the address bar, a command line or a log line; a direct URL (token included) stays
+available from `swarm_status` under `dashboard.url`. Opening is claimed once per process, so
+extra sessions and plugin reloads do not stack tabs. If the browser cannot be launched the
+server keeps running and one warning is logged.
+
+`npm run demo` replays a full run against the real engine with a stubbed model, which is the
+fastest way to see what the panels do. See [Dashboard](docs/dashboard.md) for what is shown,
+what is deliberately not shown, and the limits of the security model.
 
 ## Documentation
 

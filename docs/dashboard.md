@@ -103,6 +103,12 @@ npm run demo -- --keep-alive=600   # leave the dashboard up after the run
 npm run demo -- --repeats=3        # run it three times; each run resets the view and animates again
 ```
 
+A run starts only once a browser is actually watching: the demo polls `dashboard.info().clients`
+and waits up to 90 s for the tab to subscribe before beginning, because a background tab closes
+its event stream on `visibilitychange` and would otherwise let the whole animation play where
+nobody sees it. If nothing connects it runs anyway and says so. With `--no-open` it starts
+immediately, and `--port=N` pins the listening port instead of taking an ephemeral one.
+
 The demo is the real dashboard, real event bus, real derived state, real classifier, planner,
 step runner and verifier. Only `runtime.delegate()` is stubbed: it sleeps and returns a canned
 answer (plus a parseable verdict for the QC agent) instead of calling a provider. So the run
