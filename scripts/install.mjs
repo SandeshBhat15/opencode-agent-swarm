@@ -37,6 +37,15 @@ const LEGACY = {
   files: ['swarm-lessons.md'],
 };
 
+// Pages that accumulate local history. Copying the pristine page over one of
+// these would silently delete that history, so an existing copy always wins.
+const PRESERVE_LOCAL = new Set(['swarm/CHANGELOG.md']);
+
+// Everything this installer owns lives under the `swarm` agent namespace.
+function inSwarmNamespace(rel) {
+  return rel === 'swarm.md' || rel === 'swarm' || rel.startsWith('swarm/');
+}
+
 const log = [];
 function record(action, target) {
   log.push(`  ${action.padEnd(8)} ${target}`);
@@ -55,7 +64,9 @@ async function listMarkdown(dir) {
     const out = [];
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) out.push(...(await listMarkdown(full)).map((p) => path.join(entry.name, p)));
+      // Always report posix-style relative paths: they are compared against
+      // PRESERVE_LOCAL and the legacy names, which are written with `/`.
+      if (entry.isDirectory()) out.push(...(await listMarkdown(full)).map((p) => path.posix.join(entry.name, p)));
       else if (entry.name.endsWith('.md')) out.push(entry.name);
     }
     return out;
@@ -72,6 +83,10 @@ async function installAgents(cfg) {
     const from = path.join(sourceRoot, rel);
     const to = path.join(targetRoot, rel);
     const same = existsSync(to) && (await readFile(from, 'utf8')) === (await readFile(to, 'utf8'));
+    if (!same && existsSync(to) && PRESERVE_LOCAL.has(rel)) {
+      record('keep', `${to} (local history kept; template differs)`);
+      continue;
+    }
     record(same ? 'keep' : 'write', to);
     if (!WRITE || same) continue;
     await mkdir(path.dirname(to), { recursive: true });
@@ -79,10 +94,33 @@ async function installAgents(cfg) {
   }
 }
 
+// Prune agent pages this version no longer ships (a specialist that was renamed
+// or dropped), so an upgrade does not leave a stale agent registered. Only the
+// swarm namespace is touched: an unrelated agent page is never removed.
+async function pruneStale(cfg) {
+  const supplied = new Set(await listMarkdown(path.join(ROOT, 'agents')));
+  const targetRoot = path.join(cfg, 'agents');
+  for (const rel of await listMarkdown(targetRoot)) {
+    if (supplied.has(rel) || !inSwarmNamespace(rel)) continue;
+    const target = path.join(targetRoot, rel);
+    record('remove', target);
+    if (WRITE) await rm(target, { force: true });
+  }
+}
+
 async function removeLegacy(cfg) {
+  // A legacy name that this install also supplies is settled by the copy step,
+  // not by deletion: removing it first only churns files that are about to be
+  // rewritten, and throws away anything added inside the directory.
+  const supplied = await listMarkdown(path.join(ROOT, 'agents'));
+  const suppliedPath = (name) => supplied.includes(name) || supplied.some((rel) => rel.startsWith(`${name}/`));
   for (const name of LEGACY.agents) {
     const target = path.join(cfg, 'agents', name);
     if (!existsSync(target)) continue;
+    if (suppliedPath(name)) {
+      record('keep', `${target} (supplied by this install)`);
+      continue;
+    }
     record('remove', target);
     if (WRITE) await rm(target, { recursive: true, force: true });
   }
@@ -163,6 +201,18 @@ function canonicalizeSpec(text) {
   return { text: next, changed: next !== text };
 }
 
+// Insert a property before the closing `}` of a JSON object, adding the
+// separating comma when the object already has members. Both insertion sites
+// below used to splice text in without it, which produced `... ] "key": ...`
+// — invalid JSON, accepted by nobody and silently applied to the user's config.
+function insertProperty(text, line) {
+  const close = text.lastIndexOf('}');
+  if (close === -1) return { text, changed: false };
+  const body = text.slice(0, close).replace(/\s+$/, '');
+  const needsComma = body.length > 0 && !/[{,]$/.test(body);
+  return { text: `${body}${needsComma ? ',' : ''}\n${line}\n${text.slice(close)}`, changed: true };
+}
+
 function addPluginSpec(text) {
   if (!text.trim()) {
     const fresh = { $schema: SCHEMA, default_agent: 'swarm', plugins: [PLUGIN_DIR] };
@@ -182,22 +232,23 @@ function addPluginSpec(text) {
       return { text: next, changed: true };
     }
   }
-  const close = text.lastIndexOf('}');
-  if (close === -1) return { text, changed: false };
-  const head = text.slice(0, close).replace(/\s*$/, '');
-  const next = `${head}\n  "plugins": [\n    ${JSON.stringify(PLUGIN_DIR)}\n  ]\n${text.slice(close)}`;
-  return { text: next, changed: true };
+  return insertProperty(text, `  "plugins": [\n    ${JSON.stringify(PLUGIN_DIR)}\n  ]`);
 }
 
 function ensureDefaultAgent(text) {
-  if (!/"default_agent"/.test(text)) {
-    const close = text.lastIndexOf('}');
-    if (close === -1) return { text, changed: false };
-    const head = text.slice(0, close).replace(/\s*$/, '');
-    return { text: `${head}\n  "default_agent": "swarm"\n${text.slice(close)}`, changed: true };
-  }
+  if (!/"default_agent"/.test(text)) return insertProperty(text, '  "default_agent": "swarm"');
   const next = text.replace(/("default_agent"\s*:\s*)"[^"]*"/, '$1"swarm"');
   return { text: next, changed: next !== text };
+}
+
+function assertValidJson(file, text) {
+  try {
+    JSON.parse(text);
+  } catch (error) {
+    throw new Error(
+      `refusing to write ${file}: the result is not valid JSON (${error.message}); nothing was written`,
+    );
+  }
 }
 
 async function updateConfig(cfg) {
@@ -255,6 +306,9 @@ async function updateConfig(cfg) {
   }
 
   if (WRITE && changed) {
+    // A config the running OpenCode cannot parse takes the whole install down
+    // with it, so a plain-JSON target is validated before anything is written.
+    if (target.name.endsWith('.json')) assertValidJson(target.path, text);
     await mkdir(path.dirname(target.path), { recursive: true });
     await writeFile(target.path, text.endsWith('\n') ? text : `${text}\n`, 'utf8');
   }
@@ -273,6 +327,7 @@ async function main() {
   console.log('\nactions:');
   await removeLegacy(cfg);
   await installAgents(cfg);
+  await pruneStale(cfg);
   await updateConfig(cfg);
 
   console.log(log.join('\n') || '  (nothing to do)');
