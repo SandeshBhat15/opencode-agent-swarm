@@ -108,11 +108,11 @@ test("sanitization drops prompts, output, text and the capability token, and bou
     token: "secret",
     stepId: "build",
     tokens: 12,
-    reason: "x".repeat(400),
+    stepId: "x".repeat(400),
   });
 
-  assert.deepEqual(Object.keys(safe).sort(), ["reason", "stepId", "tokens"]);
-  assert.ok(safe.reason.length <= 97, "long strings are truncated");
+  assert.deepEqual(Object.keys(safe).sort(), ["stepId", "tokens"]);
+  assert.ok(safe.stepId.length <= 97, "long strings are truncated");
 });
 
 /* ------------------------------------------------------------- engine */
@@ -196,6 +196,12 @@ test("state distinguishes idle, running, completed, failed and unknown from real
   assert.equal(done.phase, "failed");
   assert.equal(done.verification.passed, false);
   assert.equal(done.budget.limits.maxMs, 1);
+
+  const live = createDashboardState({ now: () => 2000 });
+  live.apply({ type: "task.start", taskId: "task_2", at: 2000 });
+  live.apply({ type: "step.start", stepId: "build", role: "builder", at: 2001 });
+  live.apply({ type: "dashboard", state: "stopped", at: 2002 });
+  assert.equal(live.snapshot().agents.builder.state, "unknown", "lost observation is unknown, not completed");
 });
 
 test("roles map to the six documented agents", () => {
@@ -430,6 +436,53 @@ test("plugin-entry options arrive in setup and override creation-time config", a
     assert.deepEqual(status.dashboard.config.ignored, [], "only documented options were given");
   } finally {
     await cleanup();
+  }
+});
+
+test("sanitization blocks prompt-shaped keys in any casing", () => {
+  const safe = sanitizeEvent({ Prompt: "secret", PROMPT: "secret", userPrompt: "secret", toolOutput: "secret", stepId: "build" });
+  assert.deepEqual(safe, { stepId: "build" });
+});
+
+test("the wire drops free text even when a producer forgets to", async () => {
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const info = await dashboard.start();
+  try {
+    // A snapshot shaped like the one the verifier used to hand over.
+    const raw = () => ({
+      phase: "failed",
+      verification: { passed: false, independence: "different_model", reason: "c_scope: none of: ZEBRAUNICORN" },
+      lastError: { stepId: "build", reason: "ZEBRAUNICORN exploded" },
+    });
+    const server = await startDashboardServer({ bus: createEventBus(), snapshot: raw, token: TOKEN, port: 0 });
+    try {
+      const state = await request({ port: server.port, path: `/state?token=${TOKEN}` });
+      assert.equal(state.status, 200);
+      assert.ok(!state.body.includes("ZEBRAUNICORN"), "criterion text never reaches the wire");
+      assert.ok(!state.body.includes('"reason"'), "free-text reason fields are removed");
+    } finally {
+      await server.close();
+    }
+  } finally {
+    await dashboard.stop();
+    void info;
+  }
+});
+
+test("a real run's served state contains no prompt text anywhere", async () => {
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const info = await dashboard.start();
+  const { manager } = managerWith({ onEvent: (event) => dashboard.onEvent(event) });
+  try {
+    const task = "Research the ZEBRAUNICORN router and summarise how the catalog is scored";
+    await manager.submit(task, { workflow: "research_only", sessionID: "ses_parent" });
+
+    const state = await request({ port: info.port, path: `/state?token=${TOKEN}` });
+    assert.equal(state.status, 200);
+    assert.ok(!state.body.includes("ZEBRAUNICORN"), "the prompt word is nowhere in the served state");
+    assert.ok(!state.body.includes("Research the"), "not even a prefix of the prompt");
+  } finally {
+    await dashboard.stop();
   }
 });
 

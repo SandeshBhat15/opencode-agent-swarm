@@ -16,6 +16,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { dashboardPage } from "./page.js";
+import { sanitizeEvent } from "./events.js";
 
 export const BIND_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 0;
@@ -70,6 +71,15 @@ export async function startDashboardServer({
 
   const clients = new Set();
   let boundPort = null;
+
+  /**
+   * The derived state is redacted again at the wire, not only where it is
+   * built: proving that no field can carry prompt text must not depend on a
+   * future edit to `state.js` remembering the rule.
+   */
+  function wireState() {
+    return sanitizeEvent(snapshot());
+  }
 
   const server = http.createServer((req, res) => {
     try {
@@ -146,7 +156,7 @@ export async function startDashboardServer({
     }
 
     if (url.pathname === "/state") {
-      return send(res, 200, snapshot());
+      return send(res, 200, wireState());
     }
 
     if (url.pathname === "/events") {
@@ -186,7 +196,7 @@ export async function startDashboardServer({
     };
 
     const subscription = bus.subscribe((event) => {
-      write(`event: swarm\ndata: ${JSON.stringify({ event, state: snapshot() })}\n\n`);
+      write(`event: swarm\ndata: ${JSON.stringify({ event, state: wireState() })}\n\n`);
     });
 
     if (!subscription) {
@@ -211,7 +221,7 @@ export async function startDashboardServer({
     res.on("error", cleanup);
     req.on("aborted", cleanup);
 
-    write(`retry: 3000\nevent: snapshot\ndata: ${JSON.stringify({ ...snapshot(), events: bus.tail(40) })}\n\n`);
+    write(`retry: 3000\nevent: snapshot\ndata: ${JSON.stringify({ ...wireState(), events: bus.tail(40) })}\n\n`);
     return undefined;
   }
 

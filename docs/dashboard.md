@@ -70,12 +70,18 @@ Shown, and only when it was measured:
 Never shown:
 
 - prompt or task text, model output, tool output, file contents, source code, credentials,
-  the capability token of the session, or any absolute path.
+  the capability token of the session, or any absolute path;
+- free-text failure and verification reasons. Those quote the criterion, and a criterion is
+  derived from the user's prompt, so the wire carries an error `code`, the judge's
+  `independence`, and a failed-criterion count instead of prose.
 
-That rule is enforced in one place — `src/dashboard/events.js` — by an allowlist
-sanitizer that drops `prompt`, `output`, `text`, `task`, `content`, `messages`, `result`,
-`token`, `url`, `file` and `path` keys at any depth and truncates strings to 96 characters.
-An emission site cannot leak them by accident.
+That rule is enforced twice. At the source, `src/dashboard/events.js` drops `prompt`,
+`output`, `text`, `task`, `content`, `messages`, `result`, `reason`, `message`, `detail`,
+`error`, `token`, `url`, `file` and `path` keys - matched case-insensitively and by suffix,
+so `userPrompt` and `toolOutput` go too - and truncates every string to 96 characters. At
+the boundary, `src/dashboard/server.js` runs the whole derived state through the same
+sanitizer before writing `/state` or an SSE frame, so a producer that forgets the rule
+still cannot serve prose.
 
 An unmeasured metric is `null` on the wire and renders as **Unavailable**, never `0`. That
 is the same rule the rest of the swarm follows, applied to the UI.

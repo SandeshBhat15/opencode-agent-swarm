@@ -319,7 +319,7 @@ export function dashboardPage() {
     if (e.workflow) bits.push(e.workflow);
     if (e.passed !== undefined) bits.push(e.passed ? "passed" : "failed");
     if (e.model) bits.push(e.model);
-    if (e.reason) bits.push(String(e.reason).slice(0, 60));
+    if (e.code) bits.push(String(e.code).slice(0, 40));
     return bits.join(" ");
   }
 
@@ -353,10 +353,15 @@ export function dashboardPage() {
     }
   }
 
+  function setText(id, text) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = text;
+  }
+
   function render() {
     if (!state) return;
-    document.getElementById("runMeta").innerHTML = "run <b>" + (state.run && state.run.id ? state.run.id.slice(0, 18) : "none") + "</b>";
-    document.getElementById("updated").innerHTML = "updated <b>" + new Date(state.updatedAt || Date.now()).toLocaleTimeString() + "</b>";
+    setText("runMeta", ("run " + (state.run && state.run.id ? state.run.id.slice(0, 18) : "none")));
+    setText("updated", ("updated " + new Date(state.updatedAt || Date.now()).toLocaleTimeString()));
     renderMetrics();
     renderNodes();
     renderBars();

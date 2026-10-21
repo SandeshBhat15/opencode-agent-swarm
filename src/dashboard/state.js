@@ -129,7 +129,8 @@ export function createDashboardState({ now = () => Date.now(), handoffLimit = HA
         counters.failures += 1;
         lastError = {
           stepId: event.stepId ?? null,
-          reason: typeof event.reason === "string" ? event.reason : typeof event.error === "string" ? event.error : "step failed",
+          // An error code, never a message: messages can quote the task.
+          code: typeof event.code === "string" ? event.code.slice(0, 48) : null,
           at: event.at ?? now(),
         };
         if (event.role) finishAgent(event.role, event.at ?? now(), "failed");
@@ -140,7 +141,8 @@ export function createDashboardState({ now = () => Date.now(), handoffLimit = HA
         verification = {
           passed,
           independence: event.independence ?? null,
-          reason: typeof event.reason === "string" ? event.reason : null,
+          failedCount: Number.isFinite(event.failedCount) ? event.failedCount : null,
+          at: event.at ?? now(),
         };
         finishAgent("qc", event.at ?? now(), passed ? "completed" : "failed");
         if (event.judged === true) counters.modelCalls += 1;
@@ -174,7 +176,14 @@ export function createDashboardState({ now = () => Date.now(), handoffLimit = HA
         break;
 
       case EVENT.DASHBOARD:
-        if (event.state === "stopped" && run && run.phase === "running") run.phase = "unknown";
+        if (event.state === "stopped") {
+          if (run && run.phase === "running") run.phase = "unknown";
+          // Agents that were mid-step when observation ended are unknown, not
+          // completed: the dashboard stopped seeing them, nothing more.
+          for (const [name, agent] of Object.entries(agents)) {
+            if (agent.state === "running") agents[name] = { ...agent, state: "unknown" };
+          }
+        }
         break;
 
       default:

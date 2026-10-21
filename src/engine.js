@@ -247,7 +247,7 @@ export function createManager({
 
     progress({ phase: "executed", status: run.status, steps: run.results.size });
     for (const failure of run.failures) {
-      emit("failure", { stepId: failure.stepId, reason: failure.diagnosis?.cause ?? failure.error ?? "step failed" });
+      emit("failure", { stepId: failure.stepId, code: failure.diagnosis?.cause ?? failure.error?.code ?? null });
     }
 
     // ---- 6. independent verification --------------------------------------
@@ -266,7 +266,9 @@ export function createManager({
       emit("verify", {
         passed: verification.passed === true,
         independence: verification.independence ?? null,
-        reason: verification.reason ?? null,
+        // No free text here: a verifier's reason quotes the criterion, and a
+        // criterion is derived from the user's prompt.
+        failedCount: Array.isArray(verification.failed) ? verification.failed.length : null,
         durationMs: verification.durationMs ?? null,
       });
     }
