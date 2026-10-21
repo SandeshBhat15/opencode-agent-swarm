@@ -1,6 +1,6 @@
 {
   "name": "opencode-swarm",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Autonomous manager-led agent swarm for OpenCode V2: plans, delegates, verifies and delivers, with a deterministic decision engine, capability-based model routing, bounded budgets, persistent learning and gated self-improvement.",
   "type": "module",
   "license": "MIT",

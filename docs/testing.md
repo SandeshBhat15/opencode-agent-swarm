@@ -6,7 +6,7 @@ node --test         # equivalent, from the repository root
 ```
 
 Node's default discovery treats files matching its test patterns under `test/` as tests, so a
-bare `node --test` finds the whole suite (179 tests). Directory arguments such as
+bare `node --test` finds the whole suite (147 tests). Directory arguments such as
 `node --test test/unit test/integration` do **not** work — Node treats the directory names as
 failing test files.
 

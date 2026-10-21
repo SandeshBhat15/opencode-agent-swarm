@@ -47,10 +47,15 @@ The installer is additive and idempotent: it copies the agent pages into
 `default_agent` to `swarm`, and removes the previous swarm's files. It preserves every
 unrelated setting and never deletes anything it did not create.
 
+Two rules keep re-runs safe. Pages that accumulate local history (such as
+`agents/swarm/CHANGELOG.md`) are never overwritten once they exist, and a plain-JSON config
+is validated before it is written — the installer aborts rather than leaving OpenCode with
+a config it cannot parse. Run it without `--write` to see every action it would take.
+
 ## Test
 
 ```sh
-npm test          # 179 unit + integration tests, no network, no provider access
+npm test          # 147 unit + integration tests, no network, no provider access
 npm run live      # opt-in bounded live check against the running OpenCode server
 ```
 
