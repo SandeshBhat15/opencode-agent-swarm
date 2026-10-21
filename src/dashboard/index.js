@@ -16,23 +16,52 @@ import { openInBrowser } from "./open.js";
 
 const DEFAULT_CONFIG = Object.freeze({ enabled: true, autoOpen: true, port: 0 });
 
+/**
+ * Engine events that mean real work is under way. Notice-only events
+ * (`dashboard`, `activation`, `tool`) are handled by the plugin-level hooks,
+ * which call `engage()` themselves.
+ */
+const ENGAGEMENT_EVENTS = Object.freeze(new Set([
+  "task.start",
+  "classified",
+  "planned",
+  "step.start",
+  "delegate",
+  "verify",
+  "deliver",
+]));
+
 /** Documented keys. `open` exists so tests can inject an opener instead of a browser. */
 export const DASHBOARD_KEYS = Object.freeze(["enabled", "autoOpen", "port", "open"]);
 
 /**
  * The dashboard is on unless it is explicitly turned off. `enabled: false`
- * stops the server entirely; `autoOpen: false` keeps the server but never
- * opens a browser. `host` is intentionally not configurable.
+ * stops the server entirely.
+ *
+ * `autoOpen` is a three-way switch:
+ * - `true` (default) opens the tab once the swarm actually engages — the first
+ *   activated prompt, the first `swarm_*` tool call or the first engine event.
+ * - `"startup"` opens it as soon as the server is listening.
+ * - `false` keeps the server but never opens a browser.
+ *
+ * `host` is intentionally not configurable.
  */
 export function normalizeDashboardConfig(raw = {}) {
   const source = raw && typeof raw === "object" ? raw : {};
   const port = Number.isFinite(source.port) && source.port >= 0 && source.port <= 65535 ? Math.floor(source.port) : DEFAULT_CONFIG.port;
+  const autoOpen = source.autoOpen === false ? false : source.autoOpen === "startup" ? "startup" : true;
   return {
     enabled: source.enabled !== false,
-    autoOpen: source.autoOpen !== false,
+    autoOpen,
     port,
     ignored: Object.keys(source).filter((key) => !DASHBOARD_KEYS.includes(key)),
   };
+}
+
+/** Human-readable form of the three-way switch, for `swarm_status`. */
+function whenOf(autoOpen) {
+  if (autoOpen === "startup") return "startup";
+  return autoOpen ? "engaged" : "never";
 }
 
 export function createDashboard({ config = {}, logger = null, clock = null, token = null, open = null } = {}) {
@@ -51,6 +80,7 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
   let stopped = false;
   let error = null;
   let startedAt = null;
+  let pendingTrigger = null;
 
   function publish(event) {
     try {
@@ -71,7 +101,7 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
    * process-wide claim in `autoopen.js`, which is what makes a second session,
    * a reload or a concurrent setup a no-op instead of a second tab.
    */
-  function scheduleOpen() {
+  function scheduleOpen(trigger = "startup") {
     if (!settings.autoOpen || stopped) return null;
     if (opening) return opening;
 
@@ -87,7 +117,7 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
           resolve({ ...autoOpenState(), skipped: "no_launch_url" });
           return;
         }
-        openDashboardOnce({ url: target, logger, open: opener, now }).then(resolve, (cause) => {
+        openDashboardOnce({ url: target, logger, open: opener, now, trigger }).then(resolve, (cause) => {
           logger?.debug?.("dashboard auto-open failed", { error: String(cause?.message ?? cause) });
           resolve({ ...autoOpenState(), skipped: "error" });
         });
@@ -103,6 +133,21 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
     });
 
     return opening;
+  }
+
+  /**
+   * The swarm engaged with real work. This is the default moment to open the
+   * tab: opening at startup means a tab appears even when the dashboard has
+   * nothing to show. `startup` mode ignores this and opens earlier.
+   */
+  function engage(trigger) {
+    if (settings.autoOpen !== true || stopped) return null;
+    if (!server) {
+      // Engagement can arrive while the socket is still binding; remember it.
+      pendingTrigger = pendingTrigger ?? String(trigger);
+      return null;
+    }
+    return scheduleOpen(trigger);
   }
 
   async function start() {
@@ -123,7 +168,8 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
         error = null;
         publish({ type: EVENT.DASHBOARD, state: "started", port: server.port });
         logger?.info?.("dashboard listening", { host: BIND_HOST, port: server.port });
-        scheduleOpen();
+        if (settings.autoOpen === "startup") scheduleOpen("startup");
+        else if (pendingTrigger) scheduleOpen(pendingTrigger);
       } catch (cause) {
         error = String(cause?.message ?? cause);
         logger?.warn?.(`dashboard unavailable: ${error}`);
@@ -159,7 +205,7 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
         running: false,
         host: BIND_HOST,
         hint: 'disabled by configuration; re-enable it with { "dashboard": { "enabled": true } }',
-        autoOpen: { enabled: false, ...autoOpenState() },
+        autoOpen: { enabled: false, when: "never", ...autoOpenState() },
       };
     }
     return {
@@ -173,7 +219,7 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
       since: startedAt,
       error,
       // What actually happened to the browser, as observed — never assumed.
-      autoOpen: { enabled: settings.autoOpen, ...autoOpenState() },
+      autoOpen: { enabled: settings.autoOpen, when: whenOf(settings.autoOpen), ...autoOpenState() },
       config: { port: settings.port, autoOpen: settings.autoOpen, ignored: settings.ignored },
     };
   }
@@ -201,15 +247,21 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
     /** Engine lifecycle events (`createManager({ onEvent })`). */
     onEvent(event) {
       publish(event);
+      const type = typeof event?.type === "string" ? event.type : null;
+      if (type && ENGAGEMENT_EVENTS.has(type)) engage(type);
     },
     /** Plugin-level observations: real events, never inferred ones. */
     onPrompt({ activate = false, reason = null } = {}) {
       publish({ type: EVENT.ACTIVATION, activate: activate === true, reason });
+      if (activate === true) engage("activation");
     },
     onTool({ tool = null, status = null } = {}) {
       if (typeof tool !== "string" || !tool.startsWith("swarm_")) return;
       publish({ type: EVENT.TOOL, tool, status });
+      engage("tool");
     },
+    /** The swarm engaged with real work; opens the tab in the default mode. */
+    engage,
   };
 }
 

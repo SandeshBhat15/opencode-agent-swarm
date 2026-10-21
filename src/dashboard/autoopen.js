@@ -34,6 +34,7 @@ function record() {
     origin: null,
     error: null,
     at: null,
+    trigger: null,
   };
   globalThis[KEY] = fresh;
   return fresh;
@@ -54,12 +55,15 @@ export function resetAutoOpenState() {
  * run in the same tick cannot both win, which is what makes concurrency safe
  * without a lock.
  *
+ * @param {string|null} [trigger] what asked for the tab (`startup`, `activation`,
+ *   `tool`, or an engine event type) — recorded so `swarm_status` can say why.
  * @returns {object|null} the record when this call won, otherwise null.
  */
-export function claimAutoOpen() {
+export function claimAutoOpen(trigger = null) {
   const state = record();
   if (state.claimed) return null;
   state.claimed = true;
+  if (trigger) state.trigger = String(trigger);
   return state;
 }
 
@@ -77,10 +81,11 @@ function originOf(url) {
  * @param {object|null} [options.logger]
  * @param {(url: string) => Promise<{opened: boolean, error?: string}>} [options.open]
  * @param {() => number} [options.now]
+ * @param {string|null} [options.trigger]
  * @returns {Promise<object>} the resulting process-wide record
  */
-export async function openDashboardOnce({ url, logger = null, open = openInBrowser, now = Date.now } = {}) {
-  const state = claimAutoOpen();
+export async function openDashboardOnce({ url, logger = null, open = openInBrowser, now = Date.now, trigger = null } = {}) {
+  const state = claimAutoOpen(trigger);
   if (!state) {
     return { ...autoOpenState(), skipped: autoOpenState().skipped ?? "already_attempted" };
   }

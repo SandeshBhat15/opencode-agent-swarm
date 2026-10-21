@@ -63,10 +63,12 @@ function statusOf(ctx) {
 
 /* ---------------------------------------------------------- configuration */
 
-test("the installed defaults are on: the dashboard starts and opens unless configured otherwise", () => {
+test("the installed defaults are on, and the tab waits for the swarm to engage", () => {
   assert.deepEqual(normalizeDashboardConfig({}), { enabled: true, autoOpen: true, port: 0, ignored: [] });
   assert.equal(normalizeDashboardConfig({ enabled: false }).enabled, false, "explicit false opts out");
   assert.equal(normalizeDashboardConfig({ autoOpen: false }).autoOpen, false, "autoOpen can be turned off alone");
+  assert.equal(normalizeDashboardConfig({ autoOpen: "startup" }).autoOpen, "startup", "startup mode opens earlier");
+  assert.equal(normalizeDashboardConfig({ autoOpen: "yes" }).autoOpen, true, "anything else means the default moment");
   assert.equal(normalizeDashboardConfig({ enabled: "no" }).enabled, true, "only an explicit false disables");
   assert.deepEqual(normalizeDashboardConfig({ host: "0.0.0.0" }).ignored, ["host"], "the bind host stays unconfigurable");
 });
@@ -208,7 +210,7 @@ test("Host and Origin are still enforced before a ticket is looked at", async ()
 
 /* ----------------------------------------------------------- automatic */
 
-test("the plugin starts the dashboard and opens it once, after it is listening", async () => {
+test("the plugin starts the dashboard at load and opens one tab when the swarm engages", async () => {
   resetAutoOpenState();
   const { calls, open } = recorder();
   const ctx = createFakeContext();
@@ -219,10 +221,17 @@ test("the plugin starts the dashboard and opens it once, after it is listening",
       await waitFor(async () => (await statusOf(ctx)).dashboard?.running === true),
       "the dashboard started without being asked",
     );
+    assert.equal(calls.length, 0, "no tab before the swarm does anything");
+    assert.equal((await statusOf(ctx)).dashboard.autoOpen.claimed, false, "nothing was even attempted");
+
+    // The first swarm tool call is engagement: real work is under way.
+    ctx.__swarm.calls.toolHooks["execute.after"]({ tool: "swarm_status", status: "ok" });
     assert.ok(await waitFor(() => calls.length === 1), "exactly one browser was launched");
 
     const status = await statusOf(ctx);
     assert.equal(status.dashboard.autoOpen.enabled, true);
+    assert.equal(status.dashboard.autoOpen.when, "engaged");
+    assert.equal(status.dashboard.autoOpen.trigger, "tool", "the status says why it opened");
     assert.equal(status.dashboard.autoOpen.opened, true, "the status reports what was observed");
     assert.equal(status.dashboard.autoOpen.attempts, 1);
     assert.equal(status.dashboard.autoOpen.origin, `http://127.0.0.1:${status.dashboard.port}`);
@@ -241,6 +250,48 @@ test("the plugin starts the dashboard and opens it once, after it is listening",
   }
 });
 
+test("an activated prompt engages the swarm and opens the tab once", async () => {
+  resetAutoOpenState();
+  const { calls, open } = recorder();
+  const ctx = createFakeContext();
+  const cleanup = await bootstrap(ctx, { config: { logLevel: "silent", dashboard: { open } } });
+
+  try {
+    assert.ok(await waitFor(async () => (await statusOf(ctx)).dashboard?.running === true));
+    assert.equal(calls.length, 0, "a freshly loaded plugin shows nothing yet");
+
+    await ctx.__swarm.fire("prompt", { sessionID: "ses_parent", prompt: { text: "Build a todo app with tests" }, metadata: {} });
+    assert.ok(await waitFor(() => calls.length === 1), "the swarm engaged, so the tab appears");
+
+    const status = await statusOf(ctx);
+    assert.equal(status.dashboard.autoOpen.trigger, "activation", "opened because the swarm took the prompt");
+    assert.equal(status.dashboard.autoOpen.opened, true);
+
+    // Idle chatter that the swarm declines must not open anything.
+    resetAutoOpenState();
+    await ctx.__swarm.fire("prompt", { sessionID: "ses_other", prompt: { text: "thanks" }, metadata: {} });
+    assert.equal(calls.length, 1, "a declined prompt opens nothing new");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("dashboard.autoOpen: \"startup\" opens as soon as the listener is ready", async () => {
+  resetAutoOpenState();
+  const { calls, open } = recorder();
+  const dashboard = createDashboard({ config: { autoOpen: "startup", open }, token: TOKEN });
+
+  try {
+    const info = await dashboard.start();
+    assert.equal(info.running, true);
+    assert.ok(await waitFor(() => calls.length === 1), "startup mode needs no engagement");
+    assert.equal(info.autoOpen.when, "startup");
+    assert.equal((await dashboard.opened()).trigger, "startup");
+  } finally {
+    await dashboard.stop();
+  }
+});
+
 test("a second dashboard in the same process does not open a second tab", async () => {
   resetAutoOpenState();
   const { calls, open } = recorder();
@@ -249,8 +300,10 @@ test("a second dashboard in the same process does not open a second tab", async 
 
   try {
     await first.start();
+    first.engage("test");
     await first.opened();
     await second.start();
+    second.engage("test");
     await second.opened();
 
     assert.equal(calls.length, 1, "one tab per process, not one per dashboard");
@@ -274,6 +327,7 @@ test("concurrent initialisation opens exactly one tab", async () => {
 
   try {
     await Promise.all(dashboards.map((dashboard) => dashboard.start()));
+    for (const dashboard of dashboards) dashboard.engage("test");
     await Promise.all(dashboards.map((dashboard) => dashboard.opened()));
     assert.equal(calls.length, 1, "a race between setups still produces one tab");
     assert.equal(dashboards.filter((dashboard) => dashboard.info().running).length, 3);
@@ -343,6 +397,7 @@ test("a browser that cannot open leaves the dashboard and the swarm working", as
 
   try {
     const info = await dashboard.start();
+    dashboard.engage("test");
     const state = await dashboard.opened();
 
     assert.equal(info.running, true, "the server keeps running");
@@ -373,6 +428,8 @@ test("a failed browser launch does not disturb the plugin's tools", async () => 
   });
 
   try {
+    assert.ok(await waitFor(async () => (await statusOf(ctx)).dashboard?.running === true));
+    ctx.__swarm.calls.toolHooks["execute.after"]({ tool: "swarm_run", status: "ok" });
     assert.ok(await waitFor(async () => (await statusOf(ctx)).dashboard?.autoOpen?.failed === true));
     const status = await statusOf(ctx);
     assert.equal(status.dashboard.running, true, "the dashboard survived");
@@ -391,6 +448,7 @@ test("shutting down before the scheduled open means no browser is ever launched"
   const dashboard = createDashboard({ config: { open }, token: TOKEN });
 
   await dashboard.start();
+  dashboard.engage("test");
   await dashboard.stop();
 
   const state = await dashboard.opened();
@@ -406,6 +464,7 @@ test("cleanup stops the dashboard and leaves no opening work behind", async () =
   const cleanup = await bootstrap(ctx, { config: { logLevel: "silent", dashboard: { open } } });
 
   assert.ok(await waitFor(async () => (await statusOf(ctx)).dashboard?.running === true));
+  ctx.__swarm.calls.toolHooks["execute.after"]({ tool: "swarm_status", status: "ok" });
   assert.ok(await waitFor(() => calls.length === 1), "the tab was opened while the plugin was alive");
   const port = (await statusOf(ctx)).dashboard.port;
   await cleanup();
@@ -430,6 +489,7 @@ test("a browser that never answers cannot block plugin startup", async () => {
   try {
     assert.ok(ctx.__swarm.toolNames().includes("swarm_plan"), "startup completed while the opener was pending");
     assert.ok(await waitFor(async () => (await statusOf(ctx)).dashboard?.running === true), "the server came up anyway");
+    ctx.__swarm.calls.toolHooks["execute.after"]({ tool: "swarm_status", status: "ok" });
     const status = await statusOf(ctx);
     assert.equal(status.dashboard.running, true);
     assert.equal(status.dashboard.autoOpen.opened, false, "a pending open is never reported as opened");

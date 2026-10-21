@@ -69,7 +69,7 @@ function readDefaultBrowser() {
 async function main() {
   readDefaultBrowser();
 
-  const dashboard = createDashboard({ config: {} });
+  const dashboard = createDashboard({ config: { autoOpen: "startup" } });
   const info = await dashboard.start();
   report.dashboard = { running: info.running, host: info.host, port: info.port, enable: info.enabled, autoOpenEnabled: info.autoOpen.enabled };
   report.launcher.attempted = true;

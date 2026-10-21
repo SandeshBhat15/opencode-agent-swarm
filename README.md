@@ -79,18 +79,21 @@ docs/          architecture, agents, configuration, dashboard, efficiency, testi
 ## Mission control
 
 A local dashboard shows the six agents as live nodes, driven only by events the engine
-actually emitted. It starts with the plugin, opens once in your default browser, and never
-slows or blocks startup: the server comes up off the critical path and the browser launch
-happens in an unref'd `setImmediate`.
+actually emitted. It starts with the plugin and opens in your default browser the first time
+the swarm engages — an accepted prompt, a `swarm_*` tool call or a run starting — so no tab
+appears before there is something in it to watch. It never slows or blocks startup: the
+server comes up off the critical path and the browser launch happens in an unref'd
+`setImmediate`.
 
-Nothing to configure — but either switch turns it off:
+Nothing to configure — but each switch turns part of it off:
 
 ```jsonc
 {
   "plugins": [
     { "package": "file:///C:/path/to/opencode-agent-swarm/src/index.js",
-      "options": { "dashboard": { "autoOpen": false } } }   // serve, but do not open a tab
-      // "options": { "dashboard": { "enabled": false } }   // no dashboard at all
+      "options": { "dashboard": { "autoOpen": false } } }    // serve, but do not open a tab
+      // "options": { "dashboard": { "autoOpen": "startup" } } // open the moment the plugin loads
+      // "options": { "dashboard": { "enabled": false } }     // no dashboard at all
   ]
 }
 ```

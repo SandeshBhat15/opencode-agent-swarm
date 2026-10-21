@@ -11,7 +11,10 @@ task.
 ## Enabling it
 
 It is **on by default**. Nothing has to be configured: the server starts with the plugin, and
-once it is listening the plugin opens the page in the machine's default browser.
+the first time the swarm engages with real work — an activated prompt, the first `swarm_*`
+tool call, or the first engine event of a run — the plugin opens the page in the machine's
+default browser. Loading the plugin on its own opens nothing, so a tab never appears before
+there is something in it to watch.
 
 ```jsonc
 // turn the server off entirely — no port, no page, no browser
@@ -19,12 +22,15 @@ once it is listening the plugin opens the page in the machine's default browser.
 
 // keep the server and the swarm_status URL, but never open a tab
 { "options": { "dashboard": { "autoOpen": false } } }
+
+// open as soon as the plugin loads, without waiting for work
+{ "options": { "dashboard": { "autoOpen": "startup" } } }
 ```
 
 | Option | Default | Effect |
 |---|---|---|
 | `dashboard.enabled` | `true` | Serves the page at all. Only an explicit `false` turns it off. |
-| `dashboard.autoOpen` | `true` | Opens the page in the default browser, once, after the server is listening. `false` keeps the server and leaves opening to you. |
+| `dashboard.autoOpen` | `true` | `true` opens the page on first engagement; `"startup"` opens it as soon as the server is listening; `false` keeps the server and leaves opening to you. At most one tab per process either way. |
 | `dashboard.port` | `0` | `0` means an ephemeral port chosen by the OS. A fixed port is allowed but not recommended. |
 
 `host` is not configurable: the server refuses to bind anything except `127.0.0.1`, and
@@ -39,11 +45,13 @@ swarm runs exactly as if the dashboard were disabled.
 
 ## Opening it
 
-The plugin does this for you, at most once per OpenCode process. The rule is deliberately
-process-wide rather than per-instance: a reload, a second session, an agent spawn or two
-setups racing in the same tick all see the same claim, so the user never collects duplicate
-tabs. The claim is never released — after a reload the dashboard is a new server on a new
-port, and reopening would produce exactly the duplicate tab this prevents.
+The plugin does this for you, at most once per OpenCode process, and by default at the moment
+the swarm engages: the first prompt it accepts, the first `swarm_*` tool call, or the first
+engine event. The rule is deliberately process-wide rather than per-instance: a reload, a
+second session, an agent spawn or two setups racing in the same tick all see the same claim,
+so the user never collects duplicate tabs. The claim is never released — after a reload the
+dashboard is a new server on a new port, and reopening would produce exactly the duplicate
+tab this prevents.
 
 The opener is platform-native and never involves a shell: `cmd /d /s /c start "" <url>` on
 Windows, `open <url>` on macOS, `xdg-open <url>` on Linux — an argv array with
@@ -60,8 +68,8 @@ If you would rather open it yourself, call `swarm_status`. The result contains:
   "url": "http://127.0.0.1:51234/?token=…",
   "clients": 1,
   "autoOpen": {
-    "enabled": true, "claimed": true, "attempts": 1,
-    "opened": true, "failed": false,
+    "enabled": true, "when": "engaged", "claimed": true, "attempts": 1,
+    "opened": true, "failed": false, "trigger": "activation",
     "origin": "http://127.0.0.1:51234", "error": null
   },
   "events": { "published": 42, "retained": 42, "limit": 200, "subscribers": 1 }
@@ -70,8 +78,9 @@ If you would rather open it yourself, call `swarm_status`. The result contains:
 
 `autoOpen` reports what was **observed**, never what was intended: `opened: true` means the
 platform launcher process actually started — this side cannot see inside the browser, so it
-does not claim the page rendered. `failed: true` with an `error` means the server is fine and
-only the convenience failed.
+does not claim the page rendered. `when` is the configured moment (`engaged`, `startup` or
+`never`) and `trigger` is what actually asked for the tab. `failed: true` with an `error`
+means the server is fine and only the convenience failed.
 
 Open `url` in a browser on the same machine. The token is generated per process, held in
 memory only, never written to disk and never logged. It is returned only through the

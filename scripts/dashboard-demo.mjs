@@ -65,7 +65,7 @@ const STUB_MODELS = [
 const logger = createLogger({ level: "info", scope: "demo" });
 
 const dashboard = createDashboard({
-  config: { enabled: true, autoOpen: !noOpen, port },
+  config: { enabled: true, autoOpen: noOpen ? false : "startup", port },
   logger,
 });
 
