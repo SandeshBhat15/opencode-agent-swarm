@@ -18,7 +18,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -104,7 +104,7 @@ test("installer: comments in opencode.jsonc survive untouched", async () => {
 
   assert.match(text, /\/\/ keep this comment/);
   assert.match(text, /"model"\s*:\s*"some\/model"/);
-  assert.match(text, /opencode-agent-swarm/);
+  assert.ok(text.includes(expectSwarmSpec()), "plugin spec is registered verbatim");
   assert.match(text, /"default_agent"\s*:\s*"swarm"/);
 });
 
@@ -163,7 +163,63 @@ test("installer: the previous swarm's commands and lessons file are removed", as
   assert.equal(existsSync(path.join(cfg, "swarm-lessons.md")), false);
 });
 
+test("installer: a dry run reports and touches nothing", async () => {
+  const cfg = await sandbox();
+  const file = path.join(cfg, "opencode.json");
+  const original = `{\n  "plugins": [\n    "left-alone@1.0.0"\n  ]\n}\n`;
+  await writeFile(file, original, "utf8");
+
+  const { stdout } = await run(process.execPath, [INSTALLER], {
+    env: { ...process.env, OPENCODE_CONFIG_DIR: cfg },
+    windowsHide: true,
+  });
+
+  assert.match(stdout, /dry run/);
+  assert.equal(await readFile(file, "utf8"), original);
+  assert.equal(existsSync(path.join(cfg, "agents")), false);
+});
+
+test("installer: an already-broken plain-JSON config is refused, not silently rewritten", async () => {
+  const cfg = await sandbox();
+  const file = path.join(cfg, "opencode.json");
+  const broken = `{\n  // comments belong in .jsonc\n  "model": "some/model"\n}\n`;
+  await writeFile(file, broken, "utf8");
+
+  await assert.rejects(install(cfg), /not valid JSON to begin with/);
+  assert.equal(await readFile(file, "utf8"), broken);
+});
+
+test("installer: with both config files present only opencode.json is edited", async () => {
+  const cfg = await sandbox();
+  const plain = path.join(cfg, "opencode.json");
+  const jsonc = path.join(cfg, "opencode.jsonc");
+  await writeFile(plain, `{\n  "plugins": []\n}\n`, "utf8");
+  const jsoncText = `{\n  // hand-written formatting, keep it\n  "model": "some/model"\n}\n`;
+  await writeFile(jsonc, jsoncText, "utf8");
+
+  await install(cfg);
+
+  assert.deepEqual((await json(plain)).plugins, [expectSwarmSpec()]);
+  assert.equal(await readFile(jsonc, "utf8"), jsoncText);
+});
+
+test("installer: a swarm spec pointing at a moved clone is canonicalized, not duplicated", async () => {
+  const cfg = await sandbox();
+  const file = path.join(cfg, "opencode.json");
+  await writeFile(
+    file,
+    `{\n  "plugins": [\n    "file:///C:/old/place/opencode-agent-swarm/src",\n    "other@1.0.0"\n  ]\n}\n`,
+    "utf8",
+  );
+
+  await install(cfg);
+
+  assert.deepEqual((await json(file)).plugins, [expectSwarmSpec(), "other@1.0.0"]);
+});
+
 function expectSwarmSpec() {
-  // The installer registers the directory, never the entry file.
-  return `file:///${ROOT.replace(/\\/g, "/")}/src`.replace("file:////", "file:///");
+  // The installer registers the directory, never the entry file. Use the same
+  // conversion it uses: hand-building "file:///" breaks on paths with spaces,
+  // which percent-encode to %20.
+  return pathToFileURL(path.join(ROOT, "src")).href;
 }

@@ -55,7 +55,7 @@ a config it cannot parse. Run it without `--write` to see every action it would 
 ## Test
 
 ```sh
-npm test          # 147 unit + integration tests, no network, no provider access
+npm test          # 151 unit + integration tests, no network, no provider access
 npm run live      # opt-in bounded live check against the running OpenCode server
 ```
 

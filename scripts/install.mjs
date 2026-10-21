@@ -168,9 +168,18 @@ function stripSwarmAgents(config) {
   return changed;
 }
 
+// The plugin's identity, for recognising a config that already carries it.
+// The directory name is only two of the shapes it can take: a clone can live
+// anywhere, and the spec then is a `file://` URL to that path. Matching the
+// exact spec keeps the installer idempotent from any directory.
+const SWARM_NAMES = ['opencode-agent-swarm', 'opencode-swarm'];
+const mentionsSwarm = (text) =>
+  text.includes(PLUGIN_DIR) || SWARM_NAMES.some((name) => text.includes(name));
+
 function isSwarmSpec(entry) {
   const spec = typeof entry === 'string' ? entry : entry?.package;
-  return typeof spec === 'string' && spec.includes('opencode-agent-swarm');
+  if (typeof spec !== 'string') return false;
+  return spec === PLUGIN_DIR || SWARM_NAMES.some((name) => spec.includes(name));
 }
 
 // Index of the `]` closing the array opened at `open`, skipping over strings.
@@ -195,9 +204,11 @@ function closingBracket(text, open) {
 // Swap an existing swarm spec for the canonical directory form. Surgical, so
 // comments and formatting in `opencode.jsonc` survive untouched.
 function canonicalizeSpec(text) {
-  const quoted = /"[^"]*opencode-agent-swarm[^"]*"/;
-  if (!quoted.test(text)) return { text, changed: false };
-  const next = text.replace(quoted, JSON.stringify(PLUGIN_DIR));
+  if (text.includes(PLUGIN_DIR)) return { text, changed: false };
+  const quoted = new RegExp(`"[^"]*(?:${SWARM_NAMES.join('|')})[^"]*"`);
+  const match = quoted.exec(text);
+  if (!match) return { text, changed: false };
+  const next = text.replace(match[0], JSON.stringify(PLUGIN_DIR));
   return { text: next, changed: next !== text };
 }
 
@@ -241,14 +252,23 @@ function ensureDefaultAgent(text) {
   return { text: next, changed: next !== text };
 }
 
-function assertValidJson(file, text) {
-  try {
-    JSON.parse(text);
-  } catch (error) {
-    throw new Error(
-      `refusing to write ${file}: the result is not valid JSON (${error.message}); nothing was written`,
-    );
-  }
+function assertValidJson(file, text, before) {
+  const problem = (value) => {
+    try {
+      JSON.parse(value);
+      return null;
+    } catch (error) {
+      return error.message;
+    }
+  };
+  const after = problem(text);
+  if (!after) return;
+  const already = before ? problem(before) : null;
+  throw new Error(
+    already
+      ? `refusing to touch ${file}: it is not valid JSON to begin with (${already}). Fix it or rename it to .jsonc, then re-run; nothing was written`
+      : `refusing to write ${file}: the edit would make it invalid JSON (${after}); nothing was written`,
+  );
 }
 
 async function updateConfig(cfg) {
@@ -262,7 +282,7 @@ async function updateConfig(cfg) {
   }
 
   // Whichever file already mentions the swarm plugin keeps owning the setting.
-  const owner = present.find((file) => file.text.includes('opencode-agent-swarm')) ?? null;
+  const owner = present.find((file) => mentionsSwarm(file.text)) ?? null;
   const target =
     owner ??
     present.find((file) => file.name === 'opencode.json') ??
@@ -308,7 +328,7 @@ async function updateConfig(cfg) {
   if (WRITE && changed) {
     // A config the running OpenCode cannot parse takes the whole install down
     // with it, so a plain-JSON target is validated before anything is written.
-    if (target.name.endsWith('.json')) assertValidJson(target.path, text);
+    if (target.name.endsWith('.json')) assertValidJson(target.path, text, target.text);
     await mkdir(path.dirname(target.path), { recursive: true });
     await writeFile(target.path, text.endsWith('\n') ? text : `${text}\n`, 'utf8');
   }
