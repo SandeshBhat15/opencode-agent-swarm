@@ -14,6 +14,7 @@ import { createManager } from "../engine.js";
 import { createFsAdapter, createMemoryAdapter, createRuntimeAdapter, createStore } from "../memory/store.js";
 import { shouldActivate, managerDirective, DIRECTIVE_MARKER, MANAGER_AGENT_IDS } from "./activation.js";
 import { createRuntime } from "./adapter.js";
+import { createDashboard } from "../dashboard/index.js";
 import { createToolState, registerTools } from "./tools.js";
 
 export const PLUGIN_ID = "opencode-swarm";
@@ -28,13 +29,25 @@ function guardState() {
   return globalThis[GUARD];
 }
 
+/**
+ * Options reach a plugin two ways: at creation time (`createPlugin({ config })`,
+ * used by tests and by embedding) and from the OpenCode config entry, which the
+ * runtime passes as the second argument of `setup`. Both are merged, config
+ * entry last, so the user's `plugins` entry always wins.
+ */
 export function createPlugin({ id = PLUGIN_ID, config = {} } = {}) {
   return {
     id,
-    async setup(ctx) {
-      return bootstrap(ctx, { id, config });
+    async setup(ctx, options = null) {
+      return bootstrap(ctx, { id, config: mergeOptions(config, options) });
     },
   };
+}
+
+function mergeOptions(base, override) {
+  const a = base && typeof base === "object" && !Array.isArray(base) ? base : {};
+  const b = override && typeof override === "object" && !Array.isArray(override) ? override : {};
+  return { ...a, ...b };
 }
 
 export async function bootstrap(ctx, { id = PLUGIN_ID, config = {} } = {}) {
@@ -59,6 +72,14 @@ export async function bootstrap(ctx, { id = PLUGIN_ID, config = {} } = {}) {
 
   const runtime = createRuntime(ctx, { logger: logger.child("runtime"), clock });
   const { store, persistence } = createStore_(ctx, { logger, config });
+  // Which options actually arrived is otherwise invisible; at `debug` it is the
+  // first thing to check when a config entry seems to be ignored.
+  logger.debug("plugin options", { keys: Object.keys(config).sort() });
+  const dashboard = createDashboard({
+    config: config.dashboard ?? {},
+    logger: logger.child("dashboard"),
+    clock,
+  });
 
   const manager = createManager({
     runtime,
@@ -66,6 +87,7 @@ export async function bootstrap(ctx, { id = PLUGIN_ID, config = {} } = {}) {
     clock,
     logger: logger.child("manager"),
     policy: config.policy ?? {},
+    onEvent: (event) => dashboard.onEvent(event),
   });
 
   const state = createToolState();
@@ -85,7 +107,7 @@ export async function bootstrap(ctx, { id = PLUGIN_ID, config = {} } = {}) {
   if (typeof ctx?.tool?.transform === "function") {
     try {
       const registration = await ctx.tool.transform((editor) => {
-        registerTools(editor, { manager, runtime, logger: logger.child("tools"), state });
+        registerTools(editor, { manager, runtime, logger: logger.child("tools"), state, dashboard });
       });
       cleanups.push(() => registration?.dispose?.());
       registry.registrations.tools = [
@@ -113,6 +135,7 @@ export async function bootstrap(ctx, { id = PLUGIN_ID, config = {} } = {}) {
         if (typeof event?.tool === "string" && event.tool.startsWith("swarm_")) {
           logger.debug("swarm tool finished", { tool: event.tool, status: event.status });
         }
+        dashboard.onTool({ tool: event?.tool, status: event?.status });
       });
       cleanups.push(() => registration?.dispose?.());
       registry.registrations.hooks.push("tool.execute.after");
@@ -127,6 +150,7 @@ export async function bootstrap(ctx, { id = PLUGIN_ID, config = {} } = {}) {
       const registration = await ctx.session.hook("prompt", (event) => {
         const text = event?.prompt?.text ?? "";
         const decision = shouldActivate({ text, metadata: event?.metadata ?? null });
+        dashboard.onPrompt({ activate: decision.activate, reason: decision.reason });
         pending.set(event.sessionID, {
           text,
           decision,
@@ -177,6 +201,22 @@ export async function bootstrap(ctx, { id = PLUGIN_ID, config = {} } = {}) {
   }
 
   await manager.bootstrap();
+  cleanups.push(() => dashboard.stop());
+
+  // Optional and off the critical path: the plugin is ready whether or not the
+  // dashboard ever comes up, and a failure here is logged, never thrown.
+  if (dashboard.enabled) {
+    const kick = () => {
+      dashboard.start().catch((error) => logger.warn("dashboard start failed", { error: message(error) }));
+    };
+    if (typeof setImmediate === "function") {
+      const handle = setImmediate(kick);
+      handle.unref?.();
+    } else {
+      const handle = setTimeout(kick, 0);
+      handle.unref?.();
+    }
+  }
 
   logger.info("swarm ready", {
     instance: registry.instance,

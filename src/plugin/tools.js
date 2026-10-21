@@ -25,7 +25,7 @@ export const NAMESPACE_DESCRIPTION =
  * @param {object} editor  OpenCode `ToolEditor`
  * @param {object} deps    `{ manager, runtime, logger, state }`
  */
-export function registerTools(editor, { manager, runtime, logger, state }) {
+export function registerTools(editor, { manager, runtime, logger, state, dashboard = null }) {
   editor.namespace({ name: NAMESPACE, description: NAMESPACE_DESCRIPTION });
 
   // `editor.namespace()` only declares the namespace; a tool joins it solely
@@ -184,6 +184,7 @@ export function registerTools(editor, { manager, runtime, logger, state }) {
           toolCallsObserved: state.toolCallsObserved,
           toolFailuresObserved: state.toolFailuresObserved,
         },
+        dashboard: dashboard?.info?.() ?? { enabled: false, running: false, hint: "no dashboard in this runtime" },
       };
       return textResult(payload);
     },

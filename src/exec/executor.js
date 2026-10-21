@@ -176,7 +176,7 @@ export async function executePlan(plan, {
           mode: outcome?.mode ?? step.mode ?? null,
           model: outcome?.model ?? null,
         });
-        onProgress?.({ phase: "step.end", stepId: step.id, status: outcome?.deferred ? "deferred" : "ok" });
+        onProgress?.({ phase: "step.end", stepId: step.id, role: step.role, status: outcome?.deferred ? "deferred" : "ok", durationMs });
 
         return {
           stepId: step.id,
@@ -209,7 +209,7 @@ export async function executePlan(plan, {
             attempt,
             cause: diagnosis.cause,
           });
-          onProgress?.({ phase: "step.end", stepId: step.id, status: "failed", error: error?.message });
+          onProgress?.({ phase: "step.end", stepId: step.id, role: step.role, status: "failed", error: error?.message, durationMs });
           return {
             stepId: step.id,
             status: "failed",
@@ -223,6 +223,7 @@ export async function executePlan(plan, {
 
         const delayMs = Number.isFinite(diagnosis.delayMs) ? diagnosis.delayMs : Math.min(2000, 250 * 2 ** (attempt - 1));
         journal?.append(JOURNAL_KINDS.RETRY, { stepId: step.id, attempt, delayMs, cause: diagnosis.cause });
+        onProgress?.({ phase: "retry", stepId: step.id, role: step.role, attempt, delayMs });
         budget?.charge?.({ retries: 1 });
         lastError = error;
         logger?.debug?.(`retrying ${step.id} after ${delayMs}ms`, { cause: diagnosis.cause });

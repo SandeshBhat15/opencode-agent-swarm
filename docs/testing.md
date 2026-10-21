@@ -6,7 +6,7 @@ node --test         # equivalent, from the repository root
 ```
 
 Node's default discovery treats files matching its test patterns under `test/` as tests, so a
-bare `node --test` finds the whole suite (151 tests). Directory arguments such as
+bare `node --test` finds the whole suite (170 tests). Directory arguments such as
 `node --test test/unit test/integration` do **not** work — Node treats the directory names as
 failing test files.
 
@@ -21,6 +21,7 @@ test/unit/exec.test.js            scheduling, parallelism, retries, timeouts, bu
 test/unit/verify.test.js          deterministic criteria, verdict judging, independence
 test/unit/memory.test.js          store adapters, learning statistics, task recall
 test/unit/improve.test.js         tuner, proposals, gates, experiments, improvement loop
+test/unit/dashboard.test.js       event bus bounds, redaction, state derivation, HTTP/SSE guards
 test/integration/plugin.test.js   activation, telemetry, tool registration, hooks, cleanup
 test/integration/manager.test.js  end-to-end submit() through a fake runtime
 ```
@@ -40,6 +41,8 @@ test/integration/manager.test.js  end-to-end submit() through a fake runtime
   sessions.
 - **Resilience.** An unreachable model catalog is recorded as `source: "error"` and the run
   still proceeds; it is never reported as "zero models".
+- **Observation is inert.** A dashboard observer that throws cannot change a run's outcome,
+  the server binds loopback only, and token/Host/Origin checks reject everything else.
 
 ## Live check
 

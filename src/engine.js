@@ -51,6 +51,8 @@ export function createManager({
   learning = null,
   tuner = null,
   taskMemory = null,
+  /** Optional observer for dashboard/lifecycle events. Never affects the run. */
+  onEvent = null,
 } = {}) {
   if (!runtime) throw new TypeError("createManager requires a runtime");
 
@@ -58,6 +60,8 @@ export function createManager({
   const learningStore = learning ?? createLearning({ store, logger: logger.child?.("learning") ?? logger });
   const tunerStore = tuner ?? createTuner({ store, logger: logger.child?.("tuner") ?? logger, clock });
   const memory = taskMemory ?? createTaskMemory({ store, logger: logger.child?.("memory") ?? logger });
+
+  const managerObserver = typeof onEvent === "function" ? onEvent : null;
 
   let bootstrapped = false;
   let lastRun = null;
@@ -80,6 +84,7 @@ export function createManager({
       improve = settings.autoImprove,
       workflow: forcedWorkflow = null,
       acceptance = null,
+      onEvent: callObserver = null,
     } = options;
 
     const startedAt = clock.now();
@@ -88,6 +93,39 @@ export function createManager({
     const taskId = `task_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
     journal.append(JOURNAL_KINDS.TASK, { taskId, sessionID, task, mode });
+
+    // Observation is optional and isolated: an observer that throws (or a
+    // dashboard that is down) must never change the outcome of the run.
+    const observer = typeof callObserver === "function" ? callObserver : managerObserver;
+    const emit = (type, data = {}) => {
+      if (!observer) return;
+      try {
+        observer({ type, at: clock.now(), taskId, ...data });
+      } catch {
+        // reporting must never fail the work
+      }
+    };
+    const progress = (event) => {
+      try {
+        onProgress?.(event);
+      } catch {
+        // a caller's progress handler is not allowed to break the run
+      }
+      if (event?.phase === "step.start") {
+        emit("step.start", { stepId: event.stepId, role: event.role, attempt: event.attempt });
+      } else if (event?.phase === "step.end") {
+        emit("step.end", {
+          stepId: event.stepId,
+          role: event.role,
+          status: event.status,
+          durationMs: event.durationMs,
+        });
+      } else if (event?.phase === "retry") {
+        emit("retry", { stepId: event.stepId, role: event.role, attempt: event.attempt, delayMs: event.delayMs });
+      }
+    };
+
+    emit("task.start", { mode, sessionID });
 
     // ---- 1. deterministic classification ---------------------------------
     const classification = classify(task);
@@ -99,7 +137,8 @@ export function createManager({
       confidence: classification.confidence,
       needs: classification.needs,
     });
-    onProgress?.({ phase: "classified", kind: classification.kind, complexity: classification.complexity });
+    progress({ phase: "classified", kind: classification.kind, complexity: classification.complexity });
+    emit("classified", { kind: classification.kind, complexity: classification.complexity, confidence: classification.confidence });
 
     // ---- 2. durable memory: do not re-research a solved task -------------
     let reuse = null;
@@ -171,7 +210,15 @@ export function createManager({
       router: plan.routerHint,
       notes: plan.notes,
     });
-    onProgress?.({ phase: "planned", workflow: plan.workflow, steps: plan.steps.length, planId: plan.id });
+    progress({ phase: "planned", workflow: plan.workflow, steps: plan.steps.length, planId: plan.id });
+    emit("planned", {
+      planId: plan.id,
+      workflow: plan.workflow,
+      steps: plan.steps.map((step) => ({ id: step.id, role: step.role, needs: step.needs })),
+      criteria: plan.criteria.map((criterion) => criterion.id),
+      models: models.length,
+      catalogSource: modelsResult.source,
+    });
 
     // ---- 5. execution -----------------------------------------------------
     const preset = {};
@@ -183,7 +230,7 @@ export function createManager({
       }
     }
 
-    const runStep = createStepRunner({ runtime, router, plan, task, mode, budget, settings, journal, onProgress });
+    const runStep = createStepRunner({ runtime, router, plan, task, mode, budget, settings, journal, onProgress: progress, onEvent: emit });
     const run = await executePlan(plan, {
       runStep,
       budget,
@@ -194,11 +241,14 @@ export function createManager({
       maxRetries: overrides.retry?.maxRetries ?? settings.budget.maxRetries,
       stepTimeoutMs: settings.stepTimeoutMs,
       maxConcurrency: settings.budget.maxConcurrency,
-      onProgress,
+      onProgress: progress,
       preset,
     });
 
-    onProgress?.({ phase: "executed", status: run.status, steps: run.results.size });
+    progress({ phase: "executed", status: run.status, steps: run.results.size });
+    for (const failure of run.failures) {
+      emit("failure", { stepId: failure.stepId, reason: failure.diagnosis?.cause ?? failure.error ?? "step failed" });
+    }
 
     // ---- 6. independent verification --------------------------------------
     const evidence = collectEvidence(plan, run);
@@ -212,7 +262,13 @@ export function createManager({
         clock,
         producerModel: firstProducerModel(run),
       });
-      onProgress?.({ phase: "verified", passed: verification.passed, independence: verification.independence });
+      progress({ phase: "verified", passed: verification.passed, independence: verification.independence });
+      emit("verify", {
+        passed: verification.passed === true,
+        independence: verification.independence ?? null,
+        reason: verification.reason ?? null,
+        durationMs: verification.durationMs ?? null,
+      });
     }
 
     // ---- 7. delivery ------------------------------------------------------
@@ -250,7 +306,17 @@ export function createManager({
       criteriaPassed: verification?.results?.filter((result) => result.passed).length ?? null,
       criteriaTotal: verification?.results?.length ?? null,
     });
-    onProgress?.({ phase: "delivered", status: delivery.status });
+    progress({ phase: "delivered", status: delivery.status });
+    emit("deliver", {
+      status: delivery.status,
+      verified,
+      durationMs: delivery.durationMs,
+      tokens: metrics.usage.tokensObserved ? metrics.usage.tokens : null,
+      costUSD: metrics.usage.costObserved ? metrics.usage.costUSD : null,
+      toolCalls: metrics.usage.toolCalls ?? null,
+      budget: budget.snapshot(),
+    });
+    emit("run.end", { status: delivery.status, verified });
 
     // ---- 8. persist memory + learning ------------------------------------
     await memory.save({
@@ -349,7 +415,7 @@ async function safeModels(runtime, logger) {
   }
 }
 
-export function createStepRunner({ runtime, router, plan, task, mode, budget, settings, journal, onProgress }) {
+export function createStepRunner({ runtime, router, plan, task, mode, budget, settings, journal, onProgress, onEvent = null }) {
   return async function runStep(step, { signal, attempt, dependencies }) {
     if (budget?.check && budget.check().ok === false) throw budget.check().error;
     if (signal?.aborted) throw new CancelledError("step aborted");
@@ -371,6 +437,7 @@ export function createStepRunner({ runtime, router, plan, task, mode, budget, se
           timeoutMs: settings.stepTimeoutMs,
         });
         journal.append(JOURNAL_KINDS.DELEGATE, { stepId: step.id, agent: "swarm", mode: "headless", model: outcome?.model ?? model });
+        onEvent?.("delegate", { stepId: step.id, role: "none", agent: "swarm", model: outcome?.model ?? model ?? null });
         return { value: outcome?.text ?? "", usage: outcome?.usage ?? null, model: outcome?.model ?? model, mode: "delegated_manager" };
       }
       journal.append(JOURNAL_KINDS.DIRECT, { stepId: step.id, deferred: true, attempt });
@@ -397,12 +464,14 @@ export function createStepRunner({ runtime, router, plan, task, mode, budget, se
       timeoutMs: settings.stepTimeoutMs,
     });
 
+    const resolvedModel = outcome?.model ?? route?.ref ?? null;
     journal.append(JOURNAL_KINDS.DELEGATE, {
       stepId: step.id,
       agent: specialist.agentId,
-      model: outcome?.model ?? route?.ref ?? null,
+      model: resolvedModel,
       mode: "specialist",
     });
+    onEvent?.("delegate", { stepId: step.id, role: step.role, agent: specialist.agentId, model: resolvedModel });
     onProgress?.({ phase: "delegated", stepId: step.id, role: step.role });
 
     return {

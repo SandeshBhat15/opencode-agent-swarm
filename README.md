@@ -55,7 +55,7 @@ a config it cannot parse. Run it without `--write` to see every action it would 
 ## Test
 
 ```sh
-npm test          # 151 unit + integration tests, no network, no provider access
+npm test          # 170 unit + integration tests, no network, no provider access
 npm run live      # opt-in bounded live check against the running OpenCode server
 ```
 
@@ -70,16 +70,37 @@ src/verify     deterministic criteria and the verdict judge
 src/memory     store adapters, learning statistics, task memory
 src/improve    tuner, proposals, gates, experiments, loop
 src/plugin     OpenCode adapter, activation, telemetry, tools, plugin runtime
+src/dashboard  local read-only mission-control view (events, state, SSE server, page)
 src/engine.js  the manager
 agents/        swarm manager + specialists
-docs/          architecture, agents, configuration, efficiency, testing
+docs/          architecture, agents, configuration, dashboard, efficiency, testing
 ```
+
+## Mission control
+
+An optional local dashboard shows the six agents as live nodes, driven only by events the
+engine actually emitted. It is off by default and never slows or blocks plugin startup.
+
+```jsonc
+{
+  "plugins": [
+    { "package": "file:///C:/path/to/opencode-agent-swarm/src/index.js",
+      "options": { "dashboard": { "enabled": true } } }
+  ]
+}
+```
+
+It binds `127.0.0.1` on an ephemeral port and requires a per-process capability token. The
+exact URL (token included) is reported by `swarm_status` under `dashboard.url` — it is never
+written to disk or logged. See [Dashboard](docs/dashboard.md) for what is shown, what is
+deliberately not shown, and the limits of the security model.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Agents](docs/agents.md)
 - [Configuration](docs/configuration.md)
+- [Dashboard](docs/dashboard.md)
 - [Efficiency](docs/efficiency.md)
 - [Testing](docs/testing.md)
 
