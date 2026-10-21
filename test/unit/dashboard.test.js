@@ -25,6 +25,13 @@ import { bootstrap, createPlugin } from "../../src/plugin/runtime.js";
 
 const TOKEN = "test-token-0123456789abcdef0123456789abcdef";
 
+/**
+ * The opener seam. Tests that start an enabled dashboard would otherwise open a
+ * real browser on the machine running them, so they inject this instead and
+ * assert on its calls where the opening itself is under test.
+ */
+const noBrowser = () => Promise.resolve({ opened: false, error: "test: browser disabled" });
+
 function managerWith({ onEvent = null, worker = null } = {}) {
   const ctx = createFakeContext(worker ? { worker } : {});
   const runtime = createRuntime(ctx);
@@ -331,17 +338,18 @@ test("the page renders unavailable metrics honestly and supports reduced motion"
 /* ------------------------------------------------------- dashboard life */
 
 test("a disabled dashboard starts nothing and says why", async () => {
-  const dashboard = createDashboard({ config: {}, token: TOKEN });
+  const dashboard = createDashboard({ config: { enabled: false }, token: TOKEN });
   assert.equal(dashboard.enabled, false);
   const info = await dashboard.start();
   assert.equal(info.running, false);
-  assert.match(info.hint, /disabled by default/);
+  assert.match(info.hint, /disabled by configuration/);
   assert.equal(info.url, undefined);
+  assert.equal(info.autoOpen.enabled, false, "a disabled dashboard never opens a browser either");
   await dashboard.stop();
 });
 
 test("an enabled dashboard serves state and stops cleanly", async () => {
-  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN, open: noBrowser });
   const info = await dashboard.start();
   assert.equal(info.running, true);
 
@@ -361,7 +369,7 @@ test("an enabled dashboard serves state and stops cleanly", async () => {
 });
 
 test("starting twice is idempotent and never delays the caller", async () => {
-  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN, open: noBrowser });
   const [first, second] = await Promise.all([dashboard.start(), dashboard.start()]);
   try {
     assert.equal(first.port, second.port, "one server, not two");
@@ -375,7 +383,7 @@ test("starting twice is idempotent and never delays the caller", async () => {
 
 test("the plugin wires the dashboard, exposes it in swarm_status, and keeps unrelated tool flow intact", async () => {
   const ctx = createFakeContext();
-  const cleanup = await bootstrap(ctx, { config: { dashboard: { enabled: true } } });
+  const cleanup = await bootstrap(ctx, { config: { dashboard: { enabled: true, open: noBrowser } } });
 
   try {
     assert.ok(
@@ -405,7 +413,7 @@ test("the plugin wires the dashboard, exposes it in swarm_status, and keeps unre
 
 test("the plugin stays fully functional when the dashboard is disabled", async () => {
   const ctx = createFakeContext();
-  const cleanup = await bootstrap(ctx, { config: {} });
+  const cleanup = await bootstrap(ctx, { config: { dashboard: { enabled: false } } });
   try {
     const status = JSON.parse((await ctx.__swarm.callTool("swarm_status", {})).content[0].text);
     assert.equal(status.dashboard.enabled, false);
@@ -420,7 +428,7 @@ test("plugin-entry options arrive in setup and override creation-time config", a
   const ctx = createFakeContext();
   const plugin = createPlugin({ id: "opencode-swarm", config: { logLevel: "warn", dashboard: { enabled: false } } });
   // This is how OpenCode calls a plugin configured as `[path, options]`.
-  const cleanup = await plugin.setup(ctx, { dashboard: { enabled: true, port: 0 } });
+  const cleanup = await plugin.setup(ctx, { dashboard: { enabled: true, port: 0, open: noBrowser } });
 
   try {
     const started = await waitFor(async () => {
@@ -445,7 +453,7 @@ test("sanitization blocks prompt-shaped keys in any casing", () => {
 });
 
 test("the wire drops free text even when a producer forgets to", async () => {
-  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN, open: noBrowser });
   const info = await dashboard.start();
   try {
     // A snapshot shaped like the one the verifier used to hand over.
@@ -470,7 +478,7 @@ test("the wire drops free text even when a producer forgets to", async () => {
 });
 
 test("a real run's served state contains no prompt text anywhere", async () => {
-  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN, open: noBrowser });
   const info = await dashboard.start();
   const { manager } = managerWith({ onEvent: (event) => dashboard.onEvent(event) });
   try {
@@ -518,7 +526,7 @@ test("a model reported as an object becomes its ref, never [object Object]", () 
 test("a real run never serves [object Object] for the model", async () => {
   // The runtime's session reports the model as an object, which is exactly the
   // shape that used to reach the page verbatim.
-  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN });
+  const dashboard = createDashboard({ config: { enabled: true }, token: TOKEN, open: noBrowser });
   const info = await dashboard.start();
   const { manager } = managerWith({ onEvent: (event) => dashboard.onEvent(event) });
   try {

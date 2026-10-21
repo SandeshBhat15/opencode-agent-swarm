@@ -25,6 +25,8 @@
   "scripts": {
     "test": "node --test",
     "live": "node scripts/live-check.mjs",
+    "live:autoopen": "node scripts/autoopen-live-check.mjs",
+    "demo": "node scripts/dashboard-demo.mjs",
     "install-config": "node scripts/install.mjs"
   },
   "keywords": [

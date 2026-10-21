@@ -21,11 +21,14 @@ Options are passed through the `plugins` entry as an object:
 | `store` | — | Inject a store adapter directly (used by tests). |
 | `pluginId` | `"opencode-swarm"` | Plugin id reported to OpenCode. |
 | `maxRetries` | unset | If set, installs a `session.hook('retry')` bound so a request cannot retry forever. Left unset, no retry hook is registered and OpenCode's own behaviour is untouched. |
-| `dashboard.enabled` | `false` | Serve the local read-only mission-control page. Explicit opt-in; starting it never delays plugin setup. |
+| `dashboard.enabled` | `true` | Serve the local read-only mission-control page. On by default; only an explicit `false` turns it off. Starting it never delays plugin setup. |
+| `dashboard.autoOpen` | `true` | Open the page in the machine's default browser once the server is listening — once per OpenCode process, never per prompt, task or reload. `false` keeps the server and leaves opening to you. |
 | `dashboard.port` | `0` | Port for the dashboard. `0` = ephemeral. The bind host is always `127.0.0.1` and is not configurable. |
 
-The dashboard URL, including its per-process capability token, is reported by `swarm_status`
-under `dashboard.url`. See [Dashboard](dashboard.md).
+By default the dashboard starts with the plugin and opens itself in the default browser once
+the server is listening; the URL, including its per-process capability token, is also
+reported by `swarm_status` under `dashboard.url`, and `dashboard.autoOpen` there records
+whether the tab was actually launched. See [Dashboard](dashboard.md).
 
 ## Policy
 

@@ -6,6 +6,9 @@ node_modules/
 npm-debug.log*
 .swarm-data/
 
+# runtime state written by the goal plugin / local runs
+.opencode/
+
 # test and coverage output
 coverage/
 .nyc_output/

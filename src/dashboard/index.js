@@ -11,25 +11,35 @@ import { createEventBus } from "./bus.js";
 import { createDashboardState } from "./state.js";
 import { EVENT } from "./events.js";
 import { BIND_HOST, createToken, startDashboardServer } from "./server.js";
+import { autoOpenState, openDashboardOnce } from "./autoopen.js";
+import { openInBrowser } from "./open.js";
 
-const DEFAULT_CONFIG = Object.freeze({ enabled: false, port: 0 });
+const DEFAULT_CONFIG = Object.freeze({ enabled: true, autoOpen: true, port: 0 });
+
+/** Documented keys. `open` exists so tests can inject an opener instead of a browser. */
+export const DASHBOARD_KEYS = Object.freeze(["enabled", "autoOpen", "port", "open"]);
 
 /**
- * Explicit opt-in only: anything other than `enabled: true` leaves the
- * dashboard off. `host` is intentionally not configurable.
+ * The dashboard is on unless it is explicitly turned off. `enabled: false`
+ * stops the server entirely; `autoOpen: false` keeps the server but never
+ * opens a browser. `host` is intentionally not configurable.
  */
 export function normalizeDashboardConfig(raw = {}) {
   const source = raw && typeof raw === "object" ? raw : {};
   const port = Number.isFinite(source.port) && source.port >= 0 && source.port <= 65535 ? Math.floor(source.port) : DEFAULT_CONFIG.port;
   return {
-    enabled: source.enabled === true,
+    enabled: source.enabled !== false,
+    autoOpen: source.autoOpen !== false,
     port,
-    ignored: Object.keys(source).filter((key) => !["enabled", "port"].includes(key)),
+    ignored: Object.keys(source).filter((key) => !DASHBOARD_KEYS.includes(key)),
   };
 }
 
-export function createDashboard({ config = {}, logger = null, clock = null, token = null } = {}) {
+export function createDashboard({ config = {}, logger = null, clock = null, token = null, open = null } = {}) {
   const settings = normalizeDashboardConfig(config);
+  const source = config && typeof config === "object" ? config : {};
+  // An injected opener is a test seam, exactly like an injected store.
+  const opener = typeof open === "function" ? open : typeof source.open === "function" ? source.open : openInBrowser;
   const now = () => (typeof clock?.now === "function" ? clock.now() : Date.now());
   const bus = createEventBus({ now });
   const state = createDashboardState({ now });
@@ -37,6 +47,7 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
   const capabilityToken = token ?? createToken();
   let server = null;
   let starting = null;
+  let opening = null;
   let stopped = false;
   let error = null;
   let startedAt = null;
@@ -51,6 +62,47 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
       // A rendering problem is not a task problem.
       logger?.debug?.("dashboard event dropped", { error: String(cause?.message ?? cause) });
     }
+  }
+
+  /**
+   * Opening the browser is scheduled, never awaited. `start()` resolves as soon
+   * as the socket is listening, so a missing or slow browser can neither delay
+   * plugin initialisation nor fail it. The work itself is guarded by the
+   * process-wide claim in `autoopen.js`, which is what makes a second session,
+   * a reload or a concurrent setup a no-op instead of a second tab.
+   */
+  function scheduleOpen() {
+    if (!settings.autoOpen || stopped) return null;
+    if (opening) return opening;
+
+    opening = new Promise((resolve) => {
+      const begin = () => {
+        // Shutdown may have landed between scheduling and running.
+        if (stopped || !server) {
+          resolve({ ...autoOpenState(), skipped: "stopped" });
+          return;
+        }
+        const target = typeof server.launchUrl === "function" ? server.launchUrl() : null;
+        if (!target) {
+          resolve({ ...autoOpenState(), skipped: "no_launch_url" });
+          return;
+        }
+        openDashboardOnce({ url: target, logger, open: opener, now }).then(resolve, (cause) => {
+          logger?.debug?.("dashboard auto-open failed", { error: String(cause?.message ?? cause) });
+          resolve({ ...autoOpenState(), skipped: "error" });
+        });
+      };
+
+      if (typeof setImmediate === "function") {
+        const handle = setImmediate(begin);
+        handle.unref?.();
+      } else {
+        const handle = setTimeout(begin, 0);
+        handle.unref?.();
+      }
+    });
+
+    return opening;
   }
 
   async function start() {
@@ -71,6 +123,7 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
         error = null;
         publish({ type: EVENT.DASHBOARD, state: "started", port: server.port });
         logger?.info?.("dashboard listening", { host: BIND_HOST, port: server.port });
+        scheduleOpen();
       } catch (cause) {
         error = String(cause?.message ?? cause);
         logger?.warn?.(`dashboard unavailable: ${error}`);
@@ -105,7 +158,8 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
         enabled: false,
         running: false,
         host: BIND_HOST,
-        hint: 'disabled by default; opt in with { "dashboard": { "enabled": true } } in the plugin configuration',
+        hint: 'disabled by configuration; re-enable it with { "dashboard": { "enabled": true } }',
+        autoOpen: { enabled: false, ...autoOpenState() },
       };
     }
     return {
@@ -118,7 +172,9 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
       events: bus.stats(),
       since: startedAt,
       error,
-      config: { port: settings.port, ignored: settings.ignored },
+      // What actually happened to the browser, as observed — never assumed.
+      autoOpen: { enabled: settings.autoOpen, ...autoOpenState() },
+      config: { port: settings.port, autoOpen: settings.autoOpen, ignored: settings.ignored },
     };
   }
 
@@ -126,12 +182,19 @@ export function createDashboard({ config = {}, logger = null, clock = null, toke
     get enabled() {
       return settings.enabled;
     },
+    get autoOpen() {
+      return settings.autoOpen;
+    },
     settings,
     bus,
     state,
     start,
     stop,
     info,
+    /** Resolves once the one-time browser attempt has finished (or was skipped). */
+    opened() {
+      return opening ?? Promise.resolve(autoOpenState());
+    },
     snapshot() {
       return { ...state.snapshot(), events: bus.tail(40), dashboard: { enabled: settings.enabled, running: Boolean(server) } };
     },
@@ -155,3 +218,6 @@ export { createEventBus } from "./bus.js";
 export { createDashboardState, agentForRole } from "./state.js";
 export { dashboardPage } from "./page.js";
 export { startDashboardServer, createToken, tokenMatches, BIND_HOST } from "./server.js";
+export { createHandshake } from "./handshake.js";
+export { openInBrowser, isOpenableUrl, browserCommand } from "./open.js";
+export { autoOpenState, openDashboardOnce, resetAutoOpenState } from "./autoopen.js";

@@ -14,7 +14,13 @@ import { shouldActivate, managerDirective, isAcknowledgement, DIRECTIVE_MARKER, 
 import { normalizeTokens, textOfMessage, toolCallsOfMessages, readUsage, toLimitUsage } from "../../src/plugin/telemetry.js";
 import { createFakeContext, createFakeStorage, toolContext, FAKE_MODELS } from "../support/fake-context.js";
 
-const CONFIG = { logLevel: "silent" };
+/**
+ * The dashboard is on by default, so a bare config would start one HTTP server
+ * — and one browser attempt — per bootstrap in this file. These tests are about
+ * activation and the tool surface, so they turn it off; the dashboard has its
+ * own suite, including the default-on path.
+ */
+const CONFIG = { logLevel: "silent", dashboard: { enabled: false } };
 
 /* -------------------------------------------------------------- activation */
 

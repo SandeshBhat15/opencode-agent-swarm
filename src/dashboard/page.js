@@ -1,11 +1,14 @@
 /**
  * The dashboard page: one self-contained document, no build step, no external
- * asset. Everything it renders comes from `/events`; the only thing it reads
- * from the URL is the capability token, which is why it sets no referrer and
- * loads nothing remotely.
+ * asset. Everything it renders comes from `/events`. The capability token may
+ * arrive two ways: in the URL, as `swarm_status` reports it, or embedded in the
+ * body when the page was reached through a launch ticket — which keeps the
+ * credential out of the address bar. Either way it sets no referrer and loads
+ * nothing remotely.
  */
 
-export function dashboardPage() {
+export function dashboardPage(token = null) {
+  const embedded = typeof token === "string" && token.length > 0 ? JSON.stringify(token) : "null";
   return `<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
@@ -149,7 +152,7 @@ export function dashboardPage() {
 (function () {
   "use strict";
   var params = new URLSearchParams(location.search);
-  var token = params.get("token") || "";
+  var token = ${embedded} || params.get("token") || "";
   var agents = ["manager", "researcher", "builder", "visual", "qc", "improve"];
   var state = null;
   var log = [];

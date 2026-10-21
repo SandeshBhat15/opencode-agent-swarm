@@ -10,33 +10,46 @@ task.
 
 ## Enabling it
 
-The dashboard is off unless the plugin options say otherwise:
+It is **on by default**. Nothing has to be configured: the server starts with the plugin, and
+once it is listening the plugin opens the page in the machine's default browser.
 
 ```jsonc
-{
-  "plugins": [
-    { "package": "file:///C:/path/to/opencode-agent-swarm/src/index.js",
-      "options": { "dashboard": { "enabled": true } } }
-  ]
-}
+// turn the server off entirely — no port, no page, no browser
+{ "options": { "dashboard": { "enabled": false } } }
+
+// keep the server and the swarm_status URL, but never open a tab
+{ "options": { "dashboard": { "autoOpen": false } } }
 ```
 
 | Option | Default | Effect |
 |---|---|---|
-| `dashboard.enabled` | `false` | Explicit opt-in. Anything other than `true` leaves it off. |
+| `dashboard.enabled` | `true` | Serves the page at all. Only an explicit `false` turns it off. |
+| `dashboard.autoOpen` | `true` | Opens the page in the default browser, once, after the server is listening. `false` keeps the server and leaves opening to you. |
 | `dashboard.port` | `0` | `0` means an ephemeral port chosen by the OS. A fixed port is allowed but not recommended. |
 
 `host` is not configurable: the server refuses to bind anything except `127.0.0.1`, and
 re-checks the bound address after `listen()` in case a future refactor widens it.
 
-Starting is deliberately off the critical path. The plugin returns from `setup()` first and
-only then schedules `start()`, so a slow or failing dashboard can never delay or break
-plugin initialisation. A failure is logged at `warn` and the swarm runs exactly as if the
-dashboard were disabled.
+Everything about starting stays off the critical path. The plugin returns from `setup()`
+first and only then schedules `start()`, and `start()` resolves as soon as the socket is
+listening — the browser is opened on a later tick and never awaited. A slow, missing or
+broken browser cannot delay plugin initialisation, fail it, or keep the process alive: the
+launcher is started detached and unreferenced. A failure is logged once at `warn` and the
+swarm runs exactly as if the dashboard were disabled.
 
 ## Opening it
 
-Call `swarm_status`. The result contains:
+The plugin does this for you, at most once per OpenCode process. The rule is deliberately
+process-wide rather than per-instance: a reload, a second session, an agent spawn or two
+setups racing in the same tick all see the same claim, so the user never collects duplicate
+tabs. The claim is never released — after a reload the dashboard is a new server on a new
+port, and reopening would produce exactly the duplicate tab this prevents.
+
+The opener is platform-native and never involves a shell: `cmd /d /s /c start "" <url>` on
+Windows, `open <url>` on macOS, `xdg-open <url>` on Linux — an argv array with
+`shell: false`, so no part of the URL can be interpreted.
+
+If you would rather open it yourself, call `swarm_status`. The result contains:
 
 ```jsonc
 "dashboard": {
@@ -46,13 +59,59 @@ Call `swarm_status`. The result contains:
   "port": 51234,
   "url": "http://127.0.0.1:51234/?token=…",
   "clients": 1,
+  "autoOpen": {
+    "enabled": true, "claimed": true, "attempts": 1,
+    "opened": true, "failed": false,
+    "origin": "http://127.0.0.1:51234", "error": null
+  },
   "events": { "published": 42, "retained": 42, "limit": 200, "subscribers": 1 }
 }
 ```
 
+`autoOpen` reports what was **observed**, never what was intended: `opened: true` means the
+platform launcher process actually started — this side cannot see inside the browser, so it
+does not claim the page rendered. `failed: true` with an `error` means the server is fine and
+only the convenience failed.
+
 Open `url` in a browser on the same machine. The token is generated per process, held in
 memory only, never written to disk and never logged. It is returned only through the
-authorised `swarm_status` tool call, which is why the URL is the one way to reach the page.
+authorised `swarm_status` tool call.
+
+### What the browser is actually given
+
+The capability token is never placed on a command line. `start()` mints a **launch ticket**
+instead: 24 random bytes, valid for two minutes, redeemable once, and only for the page
+document. Redeeming it makes the server serve the page with the token embedded in the body,
+so the address bar, the browser history and every process that can read a command line hold
+nothing durable. A ticket that leaks buys one page load inside its window — not the standing
+capability, and not a single data route.
+
+## Watching the swarm work
+
+A plain chat message with the manager does not start a run: you see `activation` and `tool`
+events, and the agent nodes stay idle. The full picture — plan steps, agents moving through
+`running` → `completed`, handoff lines, counters, verification — appears when the engine
+actually runs a task (`swarm_run`, or `swarm_delegate` past the activation gate).
+
+To see it happen on demand, without spending model quota:
+
+```bash
+npm run demo                       # opens the tab and runs a three-step research → build → verify task
+npm run demo -- --delay=4000       # slower steps, easier to follow
+npm run demo -- --no-open          # serve only; prints the origin
+npm run demo -- --keep-alive=600   # leave the dashboard up after the run
+npm run demo -- --repeats=3        # run it three times; each run resets the view and animates again
+```
+
+The demo is the real dashboard, real event bus, real derived state, real classifier, planner,
+step runner and verifier. Only `runtime.delegate()` is stubbed: it sleeps and returns a canned
+answer (plus a parseable verdict for the QC agent) instead of calling a provider. So the run
+ends `delivered` with `independence: different_model`, and every frame you see came from an
+event the engine genuinely emitted — nothing is pre-scripted into the page.
+
+Exit codes: `0` when the run finished and the dashboard shut down, `1` when the server could
+not start. `SWARM_DEMO_STATE=<path>` writes `{pid, origin, startedAt, task}` so a script can
+read the port back; the capability token is never included.
 
 ## What is shown — and what is not
 
@@ -104,6 +163,11 @@ and says so. A hidden tab closes its stream and reopens it when visible again.
 - **Loopback only.** `127.0.0.1`, never `0.0.0.0`.
 - **Capability token.** 32 random bytes, base64url, compared in constant time over SHA-256
   digests. Missing or wrong → `401`.
+- **Launch tickets.** The browser is opened with a single-use ticket, never the token:
+  24 random bytes, two-minute TTL, one redemption, page document only, at most 8
+  outstanding. Host and `Origin` are validated *before* a ticket is looked at, so a page on
+  another origin cannot spend one either. The token reaches the page in its body, so it is
+  never in the address bar, the history or an argv.
 - **DNS rebinding.** The `Host` header must be `127.0.0.1:<port>` or `localhost:<port>`,
   otherwise `403`. A page served from an attacker's domain cannot read the endpoint by
   pointing a hostname at loopback.
@@ -128,6 +192,8 @@ and says so. A hidden tab closes its stream and reopens it when visible again.
 | Pending bytes per stream | 1 MB | `src/dashboard/server.js` |
 | Client log entries | 60 | `src/dashboard/page.js` |
 | Reconnect attempts | 5 | `src/dashboard/page.js` |
+| Outstanding launch tickets | 8 (oldest dropped) | `src/dashboard/handshake.js` |
+| Launch ticket lifetime | 120 s, one use | `src/dashboard/handshake.js` |
 
 A subscriber that throws three times loses its subscription and can never fail the
 publisher. The publisher is the engine, so this is the mechanism that keeps a broken
@@ -145,6 +211,12 @@ with the first.
 - It is a **live view**, not history. State is in memory, so a plugin reload or an OpenCode
   restart clears it; use the journal for durable evidence.
 - One process, one dashboard. Two OpenCode instances each get their own port and token.
+- The tab is opened **once per process**, so a plugin reload does not open a second one: the
+  page already open keeps running against its original port. Refresh it with the new
+  `swarm_status` URL after a reload if you want the new server's state.
+- `autoOpen.opened` means the platform launcher process started; it is not a claim that a
+  window became visible (a window manager may focus another desktop, or a policy may block
+  it). The `swarm_status` URL is always the fallback.
 - Node/agent placement is a fixed layout, not a force-directed graph; the edges animate
   only for handoffs that actually occurred.
 - Live verification covers the engine, the HTTP surface and SSE via the real plugin

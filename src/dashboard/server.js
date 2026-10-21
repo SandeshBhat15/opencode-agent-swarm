@@ -6,6 +6,9 @@
  *  - ephemeral port by default; the caller may pin one explicitly;
  *  - every data route needs the per-process capability token, compared in
  *    constant time and never written to disk or a log;
+ *  - a single-use, short-lived launch ticket can be exchanged for the page
+ *    document only, which is how the browser is opened without the token ever
+ *    reaching a command line;
  *  - `Host` and `Origin` are validated, so a DNS-rebinding page cannot read the
  *    endpoint through the user's browser;
  *  - GET only, no CORS headers, `no-store`, and a CSP that forbids everything
@@ -17,6 +20,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { dashboardPage } from "./page.js";
 import { sanitizeEvent } from "./events.js";
+import { createHandshake } from "./handshake.js";
 
 export const BIND_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 0;
@@ -70,6 +74,7 @@ export async function startDashboardServer({
   if (typeof token !== "string" || token.length < 16) throw new TypeError("startDashboardServer requires a capability token");
 
   const clients = new Set();
+  const handshake = createHandshake();
   let boundPort = null;
 
   /**
@@ -138,21 +143,19 @@ export async function startDashboardServer({
     }
 
     if (!tokenMatches(token, presentedToken(req, url))) {
+      // A launch ticket is the only other credential, it is single-use and
+      // short-lived, and it is accepted for the page document alone. It is
+      // exchanged here for the token, which is embedded in the body rather
+      // than in the address bar.
+      if (url.pathname === "/" && handshake.redeem(url.searchParams.get("ticket"))) {
+        return sendPage(req, res, dashboardPage(token));
+      }
       res.setHeader("WWW-Authenticate", 'Bearer realm="swarm-dashboard"');
       return send(res, 401, { error: "unauthorized" });
     }
 
     if (url.pathname === "/") {
-      const body = dashboardPage();
-      res.writeHead(200, {
-        "content-type": "text/html; charset=utf-8",
-        "content-length": Buffer.byteLength(body),
-        "content-security-policy": CSP,
-        "x-content-type-options": "nosniff",
-        "referrer-policy": "no-referrer",
-        "cache-control": "no-store",
-      });
-      return res.end(req.method === "HEAD" ? undefined : body);
+      return sendPage(req, res, dashboardPage());
     }
 
     if (url.pathname === "/state") {
@@ -164,6 +167,18 @@ export async function startDashboardServer({
     }
 
     return send(res, 404, { error: "not_found" });
+  }
+
+  function sendPage(req, res, body) {
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": Buffer.byteLength(body),
+      "content-security-policy": CSP,
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "cache-control": "no-store",
+    });
+    return res.end(req.method === "HEAD" ? undefined : body);
   }
 
   function stream(req, res) {
@@ -248,6 +263,15 @@ export async function startDashboardServer({
     port: boundPort,
     url: `http://127.0.0.1:${boundPort}/?token=${encodeURIComponent(token)}`,
     origin: `http://127.0.0.1:${boundPort}`,
+    /**
+     * A short-lived, single-use URL for opening the page in a browser. It
+     * carries a ticket rather than the token, so it is safe to hand to a child
+     * process: after one redemption (or the ticket's TTL) it authorises
+     * nothing.
+     */
+    launchUrl() {
+      return `http://127.0.0.1:${boundPort}/?ticket=${encodeURIComponent(handshake.issue())}`;
+    },
     clients() {
       return clients.size;
     },
